@@ -14,6 +14,8 @@ import { assignRefs, createCore, createInitialState, defaultConfig } from "acp-k
 import type { CoreMessage } from "acp-kernel";
 import {
     dshAgentRelayPath,
+    dshImageHandlePath,
+    dshImageOffloadPlaceholderPath,
     dshMnemonPath,
     dshSubagentSettledPath,
     durableMessageToolPaths,
@@ -53,10 +55,26 @@ describe("#5173 new dsh injection classifiers", () => {
         assert.equal(dshAgentRelayPath(mk("r4", "user", "I sent a message: hello there")), undefined, "no Agent lead-in → plain prose");
         assert.equal(dshAgentRelayPath(mk("r5", "user", "Agent X sent a message:no-space joint")), undefined, "the wrapper joint always carries the space");
     });
+
+    test("dshImageOffloadPlaceholderPath: the #6021 placeholder is anchor-ineligible in both registries", () => {
+        const placeholder = '[image omitted to fit request image limits; "image.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/image.png" (1600x900px, image/png).]有点小问题，这些unknown的按键应该是手柄按键，不应该统计';
+        const textOnly = '[image omitted because this model accepts text only; attachment sha256:2e896b95dec003df]';
+        for (const text of [placeholder, textOnly]) {
+            assert.equal(dshImageOffloadPlaceholderPath(mk("o1", "user", text)), "oneshot/image-offload-placeholder");
+            assert.equal(durableMessageToolPaths.dsh!(mk("o2", "user", text)), "oneshot/image-offload-placeholder", "slot-exclusion registry (dshDurableToolPath)");
+            assert.equal(oneShotCarrierPaths.dsh(mk("o3", "user", text)), "oneshot/image-offload-placeholder");
+            assert.equal(dshImageOffloadPlaceholderPath(mk("o4", "assistant", text)), undefined, "assistant echo must never classify (#2766)");
+        }
+        // #5752: the handle marker never appears in a placeholder, and the
+        // placeholder marker never appears in a handle — no cross-fire.
+        const handle = 'Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). Source dimensions, format, and byte size may differ.';
+        assert.equal(dshImageOffloadPlaceholderPath(mk("o5", "user", handle)), undefined);
+        assert.equal(dshImageHandlePath(mk("o6", "user", placeholder)), undefined);
+    });
 });
 
 describe("#5173 registry wiring", () => {
-    test("all eleven dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
+    test("all twelve dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
             ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
@@ -69,6 +87,7 @@ describe("#5173 registry wiring", () => {
             ["Background subagent session-x finished and will do no further work unless you send it more.", "oneshot/subagent-settled"],
             ["Agent session-y sent a message: over there", "oneshot/agent-relay"],
             ['Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). Source dimensions, format, and byte size may differ.', "oneshot/image-handle"],
+            [`[image omitted to fit request image limits; "image.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/image.png" (1600x900px, image/png).]有点小问题，这些unknown的按键应该是手柄按键，不应该统计`, "oneshot/image-offload-placeholder"],
         ];
         for (const [text, expected] of samples) {
             const msg = mk("w", "user", text);
@@ -162,5 +181,49 @@ describe("#5173 end-to-end anchor geometry", () => {
             const block = res.state.blocks.find((b) => b.active)!;
             assert.deepEqual([...block.effectiveMessageIds].sort(), ["a1", "n1", "q1", "t1"].sort(), "classified injections fold normally when they are ahead of the live request");
         }
+    });
+
+    test("image-offload placeholder after the live request never takes the anchor (#6021)", () => {
+        // PAD2 clears config.compress.minCompressRange (5000 chars) on the
+        // foldable messages, like the no-bloat pin above.
+        const PAD2 = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(30);
+        const LIVE = "current live request: run the migration now";
+        const placeholder = `[image omitted to fit request image limits; "image.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/image.png" (1600x900px, image/png).]有点小问题，这些unknown的按键应该是手柄按键，不应该统计`;
+        const msgs: CoreMessage[] = [
+            mk("p1", "user", `old question ${PAD2}`),
+            mk("p2", "assistant", `old answer ${PAD2}`),
+            mk("p3", "user", `${LIVE} ${PAD2}`),
+            mk("p4", "user", `${placeholder} ${PAD2}`),
+            mk("p5", "assistant", `working on it ${PAD2}`),
+        ];
+        const config = withDurableProtection(
+            defaultConfig(200000, { preserveRecentMessages: 1, preserveRecentTokens: 0 }),
+            durableMessageToolPaths.dsh!,
+        );
+        const run = (ms: CoreMessage[], startRef: string, endRef: string) => {
+            const c = createCore();
+            const st = createInitialState();
+            st.messageRefs = assignRefs(ms, { existing: st.messageRefs, nextIndex: 1 }).map;
+            return c.applyCompression({
+                ranges: [{ startRef, endRef, summary: "A long enough summary body to satisfy the minimum summary length gate of fifty characters." }],
+                messages: ms,
+                state: st,
+                config,
+            });
+        };
+        // The range spans the live request plus the placeholder dsh
+        // re-ingested after it. Pre-fix the placeholder was the newest
+        // text-bearing user message, so it WAS the anchor and the live
+        // request folded away — the model then answered a days-old
+        // screenshot as if it were the current question. Post-fix the
+        // anchor is p3, so only pre-anchor content (p2) folds.
+        const res = run(msgs, "m00002", "m00004");
+        assert.equal(res.result.blocksCreated, 1, `expected one block, got errors=${JSON.stringify(res.result.errors)} warnings=${JSON.stringify(res.result.warnings)}`);
+        const block = res.state.blocks.find((b) => b.active)!;
+        assert.deepEqual([...block.effectiveMessageIds].sort(), ["p2"], "only pre-anchor content folds; #6021 keeps the live request visible");
+        assert.ok(
+            res.result.warnings.some((w) => w.startsWith("Excluded") && w.includes("Last-user anchor: m00003")),
+            `receipt names the anchor ref, got: ${JSON.stringify(res.result.warnings)}`,
+        );
     });
 });

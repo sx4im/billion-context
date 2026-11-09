@@ -8,7 +8,7 @@ import {
     positionalFingerprintWorkCount,
     METADATA_EXPECTED_REBASE,
 } from "../src/fold-reconcile.ts";
-import { dshImageHandlePath, dshPastedImagePath, dshTimeContextPath, dshToolJobNoticePath, oneShotCarrierPaths, dshCarrierRawMarkers } from "../src/durable-message-guards.ts";
+import { dshImageHandlePath, dshImageOffloadPlaceholderPath, dshPastedImagePath, dshTimeContextPath, dshToolJobNoticePath, oneShotCarrierPaths, dshCarrierRawMarkers } from "../src/durable-message-guards.ts";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
@@ -288,7 +288,12 @@ describe("#5142 expected-rebase accounting", () => {
         const r = reconcileFoldCoverage(session, wire2, fullOpts);
         assert.equal(recordOf(session)?.[img.id!], "image-offload", "the production placeholder must pair structurally at its slot");
         assert.ok(!logs.some(([, m]) => m.includes("resent history drifted")), "production offload must not read as drift");
-        assert.equal(r.expectedRetired, 1);
+        // #6021: the placeholder is now a classified oneshot carrier, so
+        // Channel 1 pre-marks its OWN new id too — two expected entries for
+        // one slot rewrite: the retired image id (C3 "image-offload") and
+        // the placeholder id itself (carrier pre-mark, retired next turn).
+        assert.equal(r.expectedRetired, 2);
+        assert.equal(recordOf(session)?.[placeholder.id!], "oneshot/image-offload-placeholder");
     });
 
     test("T3a real head truncation still alarms — no expected-rebase masking (#3617 negative)", () => {
@@ -438,10 +443,32 @@ describe("#5142 carrier classifier units", () => {
         assert.equal(dshImageHandlePath(mk("user", "Image \"x.png\" (sha256:2e896b95dec003df) with no preview separator")), undefined, "plain image talk is not a handle");
     });
 
+    test("dshImageOffloadPlaceholderPath: the #6021 placeholder is its own oneshot/ family, not a handle", () => {
+        const mk = (role: CoreMessage["role"], text: string): CoreMessage =>
+            ({ id: "u", role, contentType: "text", text }) as CoreMessage;
+        const placeholder = '[image omitted to fit request image limits; "image.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/image.png" (1600x900px, image/png).]有点小问题，这些unknown的按键应该是手柄按键，不应该统计';
+        const textOnly = '[image omitted because this model accepts text only; attachment sha256:2e896b95dec003df]';
+        // Both production shapes classify in the user message, even with
+        // the user's own words riding after the closing bracket.
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", placeholder)), "oneshot/image-offload-placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", textOnly)), "oneshot/image-offload-placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", `note: ${placeholder} please check`)), "oneshot/image-offload-placeholder");
+        // #5752: the placeholder never carries the handle marker, and the
+        // handle never carries the placeholder marker — no cross-fire.
+        const handle = "Image \"image.png\" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): \"normalized/image.png\" (1600x900px, image/png). Source dimensions, format, and byte size may differ.";
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", handle)), undefined);
+        assert.equal(dshImageHandlePath(mk("user", placeholder)), undefined);
+        assert.equal(dshImageHandlePath(mk("user", textOnly)), undefined);
+        // Assistant echo and plain prose are not carriers.
+        assert.equal(dshImageOffloadPlaceholderPath(mk("assistant", placeholder)), undefined, "assistant echo must never classify (#2766)");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", "the image omitted to fit request image limits is a problem")), undefined, "prose without the semicolon marker is not a placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", "my image was omitted because the model accepts text only")), undefined, "prose paraphrase is not a placeholder");
+    });
+
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 12, "twelve raw markers for the eleven known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 14, "fourteen raw markers for the twelve known dsh carrier families");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).

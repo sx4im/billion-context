@@ -313,6 +313,34 @@ export function dshImageHandlePath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh image-offload placeholder (#6021, session evidence 2026-11-09): the
+ *  user-role text cell dsh leaves behind when it offloads a pasted image
+ *  out of the request — "[image omitted to fit request image limits;
+ *  ..." (offloadedImageText in @deepseek-ai/dsh-llm/lib/types/content.js),
+ *  plus the text-only-route sibling "[image omitted because this model
+ *  accepts text only; ...". The image → placeholder rewrite changes the
+ *  stored content identity, so the message is re-ingested with a NEW ref
+ *  and timestamp; with no classifier it stays anchor-eligible under Rule 3
+ *  (#5109) and, post-compression, is the only text-bearing user message
+ *  left visible — the model then treats a days-old screenshot as the
+ *  current question. #5752 deliberately left the placeholder out of the
+ *  handle family (it never carries "; request preview ", so the two shapes
+ *  cannot be confused); this classifies the placeholder itself, in its own
+ *  oneshot/ family — anchor eligibility only, foldability unchanged, no
+ *  context pinned. Single-marker discipline like every other classifier
+ *  here, except the family carries both production shapes (the mnemon
+ *  family does the same with two markers): `includes`, not `startsWith`,
+ *  because the placeholder rides mid-text with the user's own words after
+ *  the closing bracket. #2766: assistant-role messages are never
+ *  carriers. */
+export function dshImageOffloadPlaceholderPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        (msg.text.includes("image omitted to fit request image limits;") ||
+            msg.text.includes("image omitted because this model accepts text only;"))
+        ? "oneshot/image-offload-placeholder"
+        : undefined;
+}
+
 /** Case-insensitive ASCII prefix check over the first needle.length chars —
  *  mirrors the asciiCI convention of src/server.ts (kept local so this
  *  module stays dependency-free). */
@@ -328,8 +356,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the eleven evidence-backed identities → its
- *  canonical path (four durable carriers + seven foldable one-shot injections).
+/** dsh lane classifier: any of the twelve evidence-backed identities → its
+ *  canonical path (four durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -346,7 +374,8 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg)
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg)
     );
 }
 
@@ -404,12 +433,14 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg),
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg),
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the eleven dsh classifiers above (twelve markers:
- *  the mnemon family contributes two), so a unified-store
+ *  exact marker strings of the twelve dsh classifiers above (fourteen markers:
+ *  the mnemon family contributes two and the image-offload-placeholder
+ *  family contributes two), so a unified-store
  *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
  *  may carry megabytes of base64 media). Lockstep with the classifiers is
  *  enforced in tests/issue5142-expected-rebase.test.ts. */
@@ -426,4 +457,6 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "Background subagent ",
     " sent a message: ",
     "; request preview ",
+    "image omitted to fit request image limits;",
+    "image omitted because this model accepts text only;",
 ];
