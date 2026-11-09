@@ -716,6 +716,13 @@ def mitm_domains_from_config() -> List[str]:
                 hosts.append(host)
 
     if isinstance(data, dict):
+        # Top-level base_url/url/api: Hermes' documented config path puts the active
+        # provider's endpoint next to `provider:` (#6022) — providers/custom_providers
+        # may be absent entirely on that shape, so read it first (add() dedupes).
+        for key in ("base_url", "url", "api"):
+            if data.get(key):
+                add(data[key])
+                break
         providers = data.get("providers")
         if isinstance(providers, dict):
             for entry in providers.values():
