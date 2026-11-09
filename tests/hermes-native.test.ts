@@ -819,7 +819,7 @@ elif SCENARIO.startswith("mitm-"):
     os.makedirs(libdir, exist_ok=True)
     with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
         f.write(MINI_YAML_PARSER)
-    if kind in ("pyyaml", "parse"):
+    if kind in ("pyyaml", "parse", "toplevel"):
         with open(os.path.join(libdir, "yaml.py"), "w") as f:
             f.write(YAML_STUB_SRC)
     if kind == "ruamel":
@@ -834,13 +834,22 @@ elif SCENARIO.startswith("mitm-"):
     if kind == "none":
         sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
     sys.path.insert(0, libdir)
-    cfg_text = (
-        "providers:\n"
-        "  openrouter:\n"
-        "    base_url: https://openrouter.ai/api/v1\n"
-        "  legacy:\n"
-        "    url: https://legacy.example.com/v1\n"
-    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+    if kind == "toplevel":
+        # #6022: top-level provider + base_url, no providers map.
+        cfg_text = (
+            "provider: nous\n"
+            "base_url: https://inference-api.nousresearch.com/v1\n"
+        )
+    elif kind != "parse":
+        cfg_text = (
+            "providers:\n"
+            "  openrouter:\n"
+            "    base_url: https://openrouter.ai/api/v1\n"
+            "  legacy:\n"
+            "    url: https://legacy.example.com/v1\n"
+        )
+    else:
+        cfg_text = "providers:\n  broken line without any colon\n"
     with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
         f.write(cfg_text)
     out["mitm_kind"] = kind
@@ -1844,6 +1853,18 @@ describe("MITM-domain discovery (#2838)", () => {
             assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
         });
     }
+
+    test("top-level base_url: discovers the active provider host (#6022)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-toplevel");
+        assert.ok(out, err);
+        assert.equal(out!.mitm_kind, "toplevel");
+        assert.deepEqual(out!.mitm_domains, ["inference-api.nousresearch.com"]);
+        assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
+    });
 
     test("neither PyYAML nor ruamel importable: fails open to [] AND warns about the blind tunnel", () => {
         if (!PY) {
