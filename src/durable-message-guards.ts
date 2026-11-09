@@ -313,6 +313,34 @@ export function dshImageHandlePath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh image-offload placeholder (#6021, session evidence 2026-11-09): the
+ *  user-role text cell DSH's image-offload plugin writes over a pasted
+ *  image's wire slot — "[image omitted to fit request image limits;
+ *  "NAME" (sha256:DIGEST). Normalized copy (read-only; may be resized or
+ *  re-encoded): ...]" — and, because the rewritten content re-enters as a
+ *  NEW message (new ref + current ts), the placeholder is the only
+ *  user-role message with text in the post-compress visible zone. One-shot
+ *  like the handle it replaces: the slot carries the placeholder only
+ *  until the next offload, so retirement is accounted via
+ *  oneShotCarrierPaths. One family, two markers: the same emitter writes
+ *  the text-only-route sibling "[image omitted because this model accepts
+ *  text only; attachment sha256:...]" over the same wire slot in the same
+ *  failure mode, so it shares this family name (maintainer triage on
+ *  #6021, 2026-11-09: both markers, one family, to avoid a second PR).
+ *  Both matches use includes (not a leading-"[" match) because the
+ *  reporter's own words may follow the closing bracket. The live handle
+ *  never carries either marker and the placeholder never carries
+ *  `; request preview `, so the two families cannot be confused (that
+ *  pairing belongs to C3's structural slot evidence). A literal user echo
+ *  is benign in both directions, same argument as dshPastedImagePath.
+ *  #2766: assistant-role messages are never carriers. */
+export function dshImageOffloadPlaceholderPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
+        (msg.text.includes("image omitted to fit request image limits;") || msg.text.includes("image omitted because this model accepts text only;"))
+        ? "oneshot/image-offload-placeholder"
+        : undefined;
+}
+
 /** Case-insensitive ASCII prefix check over the first needle.length chars —
  *  mirrors the asciiCI convention of src/server.ts (kept local so this
  *  module stays dependency-free). */
@@ -328,8 +356,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the eleven evidence-backed identities → its
- *  canonical path (four durable carriers + seven foldable one-shot injections).
+/** dsh lane classifier: any of the twelve evidence-backed identities → its
+ *  canonical path (four durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -346,7 +374,8 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg)
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg)
     );
 }
 
@@ -404,11 +433,12 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg),
+        dshImageHandlePath(msg) ??
+        dshImageOffloadPlaceholderPath(msg),
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the eleven dsh classifiers above (twelve markers:
+ *  exact marker strings of the twelve dsh classifiers above (fourteen markers:
  *  the mnemon family contributes two), so a unified-store
  *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
  *  may carry megabytes of base64 media). Lockstep with the classifiers is
@@ -426,4 +456,6 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "Background subagent ",
     " sent a message: ",
     "; request preview ",
+    "image omitted to fit request image limits;",
+    "image omitted because this model accepts text only;",
 ];

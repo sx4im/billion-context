@@ -288,7 +288,12 @@ describe("#5142 expected-rebase accounting", () => {
         const r = reconcileFoldCoverage(session, wire2, fullOpts);
         assert.equal(recordOf(session)?.[img.id!], "image-offload", "the production placeholder must pair structurally at its slot");
         assert.ok(!logs.some(([, m]) => m.includes("resent history drifted")), "production offload must not read as drift");
-        assert.equal(r.expectedRetired, 1);
+        // #6021: the placeholder is now also a classified one-shot carrier, so
+        // its own NEW id is marked on first sight (channel 1) alongside the
+        // retired image id paired structurally (channel 3): 2 expected
+        // retirements, split 1 carrier + 1 offload in the note.
+        assert.equal(r.expectedRetired, 2);
+        assert.ok(logs.some(([, m]) => m.includes("2 covered id(s) retired by expected host behavior (1 one-shot carrier(s), 1 image offload rewrite(s))")), "the expected-rebase note names the 1+1 split");
     });
 
     test("T3a real head truncation still alarms — no expected-rebase masking (#3617 negative)", () => {
@@ -441,7 +446,7 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 12, "twelve raw markers for the eleven known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 14, "fourteen raw markers for the twelve known dsh carrier families");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).
