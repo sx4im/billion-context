@@ -10,8 +10,11 @@
 //   rung 2  body conversationId — legacy/extension hosts (no witness yet);
 //           an id no model request ever arrived under is a loud 400, never
 //           a guess (#1158 diagnostic);
-//   rung 3  single-active arbitration — no witness, no id, exactly one
-//           fresh conversation on the proxy;
+//   rung 3  refuse-to-guess — no witness, no id, exactly one fresh
+//           conversation on the proxy: #6541 retired the single-active
+//           arbitration (a foreign MCP client with no model traffic ever
+//           reaching this proxy read the only active session's whole
+//           compression view through it), so the id-less call 400s;
 //   rung 4  refuse-to-guess — no witness, no id, two fresh conversations:
 //           loud 400 naming the ambiguity.
 //
@@ -34,8 +37,7 @@ import type { ProxyOptions } from "../src/config.ts";
 // stateDir() resolves XDG_STATE_HOME per call, but loadConversations() at
 // boot would otherwise read the DEVELOPER'S production
 // plugin-conversations.json — live sessions from real traffic would count
-// as "fresh conversations" and break the single-active arbitration
-// assertions below.
+// as "fresh conversations" and break the fresh-conversation assertions below.
 const xdgRoot = mkdtempSync(path.join(tmpdir(), "bc-e2e-tool-routing-"));
 process.env.XDG_STATE_HOME = path.join(xdgRoot, "state");
 process.env.XDG_CACHE_HOME = path.join(xdgRoot, "cache");
@@ -181,19 +183,25 @@ async function toolPost(h: Harness, body: Record<string, unknown>): Promise<{ st
     return { status: res.status, json: await res.json().catch(() => null) };
 }
 
-test("plugin tool routing ladder: arb → witness beats two-active → refuse-to-guess → loud 400 on unknown body id", async () => {
+test("plugin tool routing ladder: refuse-to-guess with one active (#6541) → witness beats two-active → refuse-to-guess → loud 400 on unknown body id", async () => {
     const h = await boot();
     try {
-        // ── rung 3: single fresh conversation, no witness → arbitration ──
+        // ── rung 3 (#6541): single fresh conversation, no witness, no id —
+        // the retired arbitration used to route this into the only active
+        // session, letting a foreign MCP client (ZCode: its model traffic
+        // never reaches this proxy, so it can never carry a conversationId)
+        // read the other client's whole compression view. Now it must
+        // refuse to guess instead — and leak nothing.
         await modelTurn(h, "routing-conv-a", "plain turn one for the arbitration leg");
         let r = await toolPost(h, { tool: "acp_status" });
-        assert.equal(r.status, 200, "single-active arbitration must route the id-less call");
-        assert.equal(r.json?.ok, true);
+        assert.equal(r.status, 400, "id-less call must refuse to guess even with exactly one active conversation (#6541)");
+        assert.match(String(r.json?.error), /refuse to guess/, "the refusal must name the ambiguity loudly");
+        assert.notEqual(r.json?.ok, true, "no session data may leak to the id-less caller");
 
         // ── rung 1: second conversation streams an acp_status tool_use in a
         // plain-JSON (non-stream) response — recording lane 5 (#1692) ──
         await modelTurn(h, "routing-conv-b", "WITNESS:acp_status turn that streams the tool call");
-        // With TWO fresh conversations arbitration can only 400 — so a 200 now
+        // With TWO fresh conversations an id-less call can only 400 — so a 200 now
         // proves the outbound witness matched, and the only ring entry belongs
         // to routing-conv-b.
         r = await toolPost(h, { tool: "acp_status" });

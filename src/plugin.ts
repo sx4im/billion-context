@@ -339,8 +339,10 @@ const snapshotRefsEvaluatedStore = new WeakMap<Session, unknown>();
 // resume — warn once per conversation instead of on every rejected tool call.
 const warnedNoModelRequests = new Set<string>();
 const WARNED_NO_MODEL_REQUESTS_CAP = 4096;
-/** #1685 freshness window for single-active arbitration — same scale as the
- *  tool-witness TTL in tool-ring.ts. */
+/** #1685 freshness window — same scale as the tool-witness TTL in
+ *  tool-ring.ts. #6541 retired the single-active arbitration it sized; the
+ *  window now only counts the "N conversations active" figure in the
+ *  refuse-to-guess error. */
 const WITNESS_TTL_MS_PLUGIN = 10 * 60 * 1000;
 
 // The conversationId → session mapping is in-memory. Persist it so a resumed
@@ -2198,8 +2200,10 @@ export async function handlePluginTool(
     if (parsed.expectedRevision !== undefined && !conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision requires conversationId" });
     // Explicit ids never yield to another session's outbound witness. A
     // conflicting witness rejects unconfirmed ids; host-stamped ids (#2024)
-    // remain authoritative. Id-less calls use a unique witness, then a single
-    // fresh conversation, or fail loudly without guessing (#1685).
+    // remain authoritative. Id-less calls use a unique witness, or fail
+    // loudly without guessing (#1685) — #6541 retired the single-fresh-
+    // conversation arbitration: an id-less caller cannot prove which
+    // session is its own, so adopting the only active one leaked it.
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
     // #4580: Claude Code (≥2.1.308) stamps every MCP tools/call with the
     // originating tool_use id (the shim reads _meta["claudecode/toolUseId"]
@@ -2223,7 +2227,7 @@ export async function handlePluginTool(
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
-    let routedBy: "witness" | "body" | "arb" | "native" = "body";
+    let routedBy: "witness" | "body" | "native" = "body";
     if (toolUseSession) {
         // #4580: the host's own per-call id named this lane. Note it: routing
         // by call id is new behavior and the log line is the fastest way to
@@ -2312,27 +2316,24 @@ export async function handlePluginTool(
         return;
     }
     if (!session && !conversationId) {
+        // #6541: an id-less call with no outbound witness carries zero
+        // evidence of belonging to ANY session — the old single-active
+        // arbitration ("exactly one fresh conversation, adopt it") handed a
+        // foreign MCP client (ZCode: its model traffic never reaches this
+        // proxy, so it can never carry a conversationId) the other client's
+        // whole compression view. A caller with no identity cannot prove
+        // which session is its own, so there is nothing to arbitrate: refuse
+        // to guess exactly as the multi-conversation case already does, and
+        // say how to bind instead.
         const now = Date.now();
         let fresh = 0;
-        let bestCid: string | undefined;
-        let bestSeen = -Infinity;
-        for (const [cid, e] of conversations) {
+        for (const [, e] of conversations) {
             if (now - e.lastSeen > WITNESS_TTL_MS_PLUGIN) continue;
             fresh++;
-            if (e.lastSeen > bestSeen) {
-                bestSeen = e.lastSeen;
-                bestCid = cid;
-            }
         }
-        if (bestCid && fresh === 1) {
-            entry = conversations.get(bestCid);
-            session = entry ? peekSession(entry.sessionId) : undefined;
-            if (session) routedBy = "arb";
-        } else {
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": no conversationId, no outbound witness match, and ${fresh} conversation${fresh === 1 ? "" : "s"} active on this proxy — refuse to guess. Send a model message first, or bind the MCP shim (CLAUDE_CODE_SESSION_ID / BILI_CONVERSATION_ID).` }));
-            return;
-        }
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": no conversationId, no outbound witness match, and ${fresh} conversation${fresh === 1 ? "" : "s"} active on this proxy — refuse to guess. Send a model message first, or bind the MCP shim (CLAUDE_CODE_SESSION_ID / BILI_CONVERSATION_ID).` }));
+        return;
     }
     if (!session) {
         session = await resolveForkConversation(conversationId);
