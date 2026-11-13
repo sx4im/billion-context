@@ -166,6 +166,60 @@ export function isGcEligible(view: FileView, now: number, cfg: Pick<GcConfig, "m
     return base + (view.storedTokens ?? 0) <= cfg.maxTokens;
 }
 
+/**
+ * Per-sweep suffix lookup (#6609): find session files whose basename ends
+ * with a given suffix (e.g. `<hash>.json`) without rescanning the whole
+ * list per companion. A sorted index of reversed basenames turns the
+ * arbitrary-suffix match into a prefix range lookup; matches are returned
+ * in the original filesystem-walk order so the twin-guard and orphan-pass
+ * probes see the same candidates, in the same order, as the old linear
+ * scan. Built lazily — only when companion matching is actually needed —
+ * so sweeps with no companions (or no old orphans / deletions) pay nothing.
+ * Reversal is by UTF-16 code unit on both sides, so the prefix relation on
+ * reversed strings is exactly the suffix relation on the originals,
+ * including astral-plane (surrogate-pair) names.
+ */
+export interface SessionSuffixLookup {
+    /** Session files (walk order) whose basename ends with `suffix`. */
+    find(suffix: string): string[];
+}
+
+export function buildSessionSuffixLookup(sessionFiles: readonly string[]): SessionSuffixLookup {
+    const entries = sessionFiles.map((file, index) => ({
+        reversed: reverseString(path.basename(file)),
+        index,
+    }));
+    entries.sort((a, b) => (a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : 0));
+    return {
+        find(suffix: string): string[] {
+            const needle = reverseString(suffix);
+            // All strings starting with `needle` form one contiguous block
+            // beginning at its lower bound; scan it and restore walk order.
+            const hits: number[] = [];
+            for (let i = lowerBound(entries, needle); i < entries.length && entries[i].reversed.startsWith(needle); i++) {
+                hits.push(entries[i].index);
+            }
+            hits.sort((a, b) => a - b);
+            return hits.map((i) => sessionFiles[i]);
+        },
+    };
+}
+
+function reverseString(s: string): string {
+    return s.split("").reverse().join("");
+}
+
+function lowerBound(entries: readonly { reversed: string }[], prefix: string): number {
+    let lo = 0;
+    let hi = entries.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (entries[mid].reversed < prefix) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 async function walkSessionFiles(dir: string): Promise<string[]> {
     const entries = await readdir(dir, { withFileTypes: true });
     const out: string[] = [];
@@ -216,6 +270,12 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     }
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
+    // #6609: the suffix index is built lazily — only if a deleted session
+    // has a companion (twin guard) or an old orphan companion needs a
+    // reference check. The list is fixed for the sweep; the deleted-session
+    // check stays per candidate, as before.
+    let suffixLookup: SessionSuffixLookup | null = null;
+    const companionsLookup = (): SessionSuffixLookup => (suffixLookup ??= buildSessionSuffixLookup(sessionFiles));
     for (const file of sessionFiles) {
         let st;
         try {
@@ -316,9 +376,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of companionsLookup().find(stem + ".json")) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -370,12 +429,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of companionsLookup().find(stem + ".json")) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;

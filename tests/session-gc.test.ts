@@ -15,7 +15,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
-import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { buildSessionSuffixLookup, contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
 import { restoreExportDirName } from "../src/image-restore.js";
 
 const DAY = 86_400_000;
@@ -680,5 +680,120 @@ test("gcSessionFiles: session deletion co-deletes its image spill dir; stale spi
         assert.ok(!existsSync(spill), "spill dir co-deleted with its session despite fresh mtime");
         assert.ok(!existsSync(orphan), "stale orphan swept");
         assert.ok(existsSync(fresh), "fresh spill dir kept");
+    });
+});
+
+test("buildSessionSuffixLookup: arbitrary suffixes, walk order, unicode (#6609)", () => {
+    const files = [
+        "b/b_abc.json",
+        "a/a_abc.json",
+        "c/abc.json",
+        "d/other.json",
+        "e/abc.json.bak",
+        "f/会话_abc.json",
+        "g/😀_abc.json",
+    ];
+    const lookup = buildSessionSuffixLookup(files);
+    assert.deepEqual(
+        lookup.find("abc.json"),
+        ["b/b_abc.json", "a/a_abc.json", "c/abc.json", "f/会话_abc.json", "g/😀_abc.json"],
+        "suffix match regardless of prefix, walk order preserved (not reversed-sort order)",
+    );
+    assert.deepEqual(lookup.find("other.json"), ["d/other.json"]);
+    assert.deepEqual(lookup.find("missing.json"), []);
+    assert.deepEqual(lookup.find("b_abc.json"), ["b/b_abc.json"], "full-basename suffix");
+    assert.deepEqual(
+        lookup.find(".json"),
+        files.filter((f) => f.endsWith(".json")),
+        "bare extension suffix matches every session file",
+    );
+    assert.deepEqual(buildSessionSuffixLookup(["x/same.json", "y/same.json"]).find("same.json"), ["x/same.json", "y/same.json"], "same basename in two namespaces, walk order");
+    assert.deepEqual(buildSessionSuffixLookup([]).find("abc.json"), []);
+});
+
+test("gcSessionFiles: companion matching is indexed, not a per-companion rescan (#6609)", async () => {
+    const dir = tmpDir("bili-gc-index-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const count = 200;
+        for (let i = 0; i < count; i++) {
+            const hash = `idx${String(i).padStart(6, "0")}abcdef`;
+            writeFile(dir, `ns/host_${hash}.json`, JSON.stringify(envelope(`gc-idx-${hash}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+            contentStoreFile(dir, `_unknown/${hash}.content-store.json`, 100, 10);
+        }
+        // Count path.basename calls for one sweep: the old orphan pass called
+        // it once per candidate session per companion (~count^2/2). The
+        // indexed lookup calls it once per session file at index build.
+        const pathModule = path as unknown as { basename: (p: string, ext?: string) => string };
+        const origBasename = pathModule.basename;
+        let calls = 0;
+        pathModule.basename = ((p: string, ext?: string) => {
+            calls++;
+            return ext === undefined ? origBasename(p) : origBasename(p, ext);
+        });
+        try {
+            const res = await gcSessionFiles({ dir, store, now: Date.now() });
+            assert.equal(res.removed, 0, JSON.stringify(res));
+            assert.equal(res.companionsRemoved, 0, "every companion still referenced by its live session");
+            assert.ok(calls < 5000, `expected near-linear basename calls, got ${calls} for ${count} sessions + ${count} companions`);
+        } finally {
+            pathModule.basename = origBasename;
+        }
+    });
+});
+
+test("gcSessionFiles: unreadable twin store keeps the stale duplicate's companion (#6609)", async () => {
+    const dir = tmpDir("bili-gc-twinbad-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // The twin's own store exists but is unreadable: the stale sibling
+        // stays the twin's live fallback store (loadContentStore falls
+        // through to _unknown/ when the namespaced store is unreadable).
+        const stem = "twinbadcafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twinbad-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-twinbad-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const fBadTwinStore = writeFile(dir, `anthropic/api.example.com_${stem}.content-store.json`, "{not json", 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fDup), "stale duplicate deleted");
+        assert.ok(existsSync(fTwin), "live twin untouched");
+        assert.ok(existsSync(fCmp), "companion kept: twin's own store is unreadable, so the sibling is still its live store");
+        assert.ok(existsSync(fBadTwinStore));
+    });
+});
+
+test("gcSessionFiles: arbitrary-suffix twin keeps the stale duplicate's companion (#6609)", async () => {
+    const dir = tmpDir("bili-gc-twinsfx-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // The twin shares only the hash stem as a SUFFIX (zz<stem>.json),
+        // not a fixed namespace prefix — the suffix lookup must still find it.
+        const stem = "twinsfxcafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twinsfx-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/zz${stem}.json`, JSON.stringify(envelope(`gc-twinsfx-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fDup));
+        assert.ok(existsSync(fTwin));
+        assert.ok(existsSync(fCmp), "arbitrary-suffix twin without its own store keeps the companion");
+    });
+});
+
+test("gcSessionFiles: unicode session names match across namespaces (#6609)", async () => {
+    const dir = tmpDir("bili-gc-uni-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const stem = "会话😀abc1234";
+        const fSess = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-uni-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(existsSync(fSess));
+        assert.ok(existsSync(fCmp), "unicode stem matches across namespaces");
     });
 });
