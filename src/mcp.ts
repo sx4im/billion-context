@@ -168,7 +168,7 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
         const effectiveConversationId = conversationIdOverride ?? conversationId;
         let res: Response;
         try {
-            const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args };
+            const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args, agent: "mcp" };
             // #2024: flag host-stamped per-call identity (Codex _meta.threadId) so
             // the proxy ranks it above a content-based witness. Static env/meta
             // bindings and model-transcribed ids are NOT flagged — their

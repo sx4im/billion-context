@@ -12,6 +12,9 @@
 //           a guess (#1158 diagnostic);
 //   rung 3  single-active arbitration — no witness, no id, exactly one
 //           fresh conversation on the proxy;
+//   rung 3 exception (#6541): an MCP-forwarded id-less call NEVER arbitrates
+//           — a foreign client with no conversation of its own gets a loud
+//           400, never another session's view;
 //   rung 4  refuse-to-guess — no witness, no id, two fresh conversations:
 //           loud 400 naming the ambiguity.
 //
@@ -284,6 +287,39 @@ test("MCP shim (codex-style host): body-id lane routes a registered conversation
         assert.ok(ours, `shim must answer the tools/call request; stderr: ${stderr.slice(0, 400)}`);
         const text = ours.result?.content?.map((c) => c.text ?? "").join("") ?? "";
         assert.match(text, /ACTIVE SURFACE/, "acp_status result must come back through the shim");
+    } finally {
+        await h.stop();
+    }
+});
+
+test("#6541: MCP shim with no conversation id is never arbitrated into the single active session", async () => {
+    const h = await boot();
+    try {
+        // The conversations map is process-global: earlier tests in this file
+        // leave their conversations behind. Clear it so this test owns the
+        // single-fresh-conversation shape it asserts on.
+        _resetPluginStateForTest();
+        // One active conversation (the DSH session): a single fresh
+        // conversation is exactly the shape that used to arbitrate a foreign
+        // id-less caller into it. Drive the REAL shim with neither
+        // CLAUDE_CODE_SESSION_ID nor BILI_CONVERSATION_ID set — the ZCode
+        // shape, whose model traffic never reaches this proxy.
+        await modelTurn(h, "routing-dsh-6541", "plain turn for the dsh session leg");
+        resetToolRingForTest();
+        const { stdout, stderr } = await mcpCall(h.baseUrl, "", "tools/call", { name: "acp_status", arguments: {} }, 8);
+        const replies = stdout.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) as Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }>;
+        const ours = replies.find((x) => x.id === 8);
+        assert.ok(ours, `shim must answer the tools/call request; stderr: ${stderr.slice(0, 400)}`);
+        const text = ours.result?.content?.map((c) => c.text ?? "").join("") ?? "";
+        assert.equal(ours.result?.isError, true, "the refusal must surface as an MCP error, not a result");
+        assert.match(text, /refuse to guess/, "the refusal must name the ambiguity loudly");
+        assert.match(text, /this MCP client carries no conversationId/, "the refusal must be the #6541 MCP path, not the multi-active path");
+        assert.doesNotMatch(text, /ACTIVE SURFACE/, "a foreign client must never see the other session's status");
+        // And the session itself is untouched: a plain id-less call still
+        // arbitrates exactly as rung 3 pins.
+        const r = await toolPost(h, { tool: "acp_status" });
+        assert.equal(r.status, 200, "non-MCP id-less arbitration is unchanged");
+        assert.equal(r.json?.ok, true);
     } finally {
         await h.stop();
     }

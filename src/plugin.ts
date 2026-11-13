@@ -2182,9 +2182,9 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown; agent?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown; agent?: unknown };
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected tool object");
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
@@ -2199,7 +2199,8 @@ export async function handlePluginTool(
     // Explicit ids never yield to another session's outbound witness. A
     // conflicting witness rejects unconfirmed ids; host-stamped ids (#2024)
     // remain authoritative. Id-less calls use a unique witness, then a single
-    // fresh conversation, or fail loudly without guessing (#1685).
+    // fresh conversation, or fail loudly without guessing (#1685) — except
+    // MCP-forwarded id-less calls, which never arbitrate (#6541).
     const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
     // #4580: Claude Code (≥2.1.308) stamps every MCP tools/call with the
     // originating tool_use id (the shim reads _meta["claudecode/toolUseId"]
@@ -2325,6 +2326,19 @@ export async function handlePluginTool(
             }
         }
         if (bestCid && fresh === 1) {
+            // #6541: an MCP-forwarded call (the shim stamps agent "mcp", same
+            // marker its register call already sends) carries no conversation
+            // of its own — and an external client whose model traffic never
+            // reaches this proxy can never own the single fresh conversation.
+            // Arbitrating it in would hand a foreign client another session's
+            // view, so fail closed here instead of guessing. Witness, body-id
+            // and tool-call-id routing above are untouched: a bound MCP call
+            // still routes exactly as before.
+            if (typeof parsed.agent === "string" && parsed.agent.trim() === "mcp") {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": this MCP client carries no conversationId and nothing ties it to the single active conversation — refuse to guess. Bind the MCP shim to its own conversation (BILI_CONVERSATION_ID) or send a model message first.` }));
+                return;
+            }
             entry = conversations.get(bestCid);
             session = entry ? peekSession(entry.sessionId) : undefined;
             if (session) routedBy = "arb";

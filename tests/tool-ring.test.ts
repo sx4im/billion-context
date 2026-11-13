@@ -205,6 +205,38 @@ describe("#1685 handlePluginTool routing ladder", () => {
         assert.equal(r.status, 400);
         assert.match(String(r.json.error), /0 conversations active/);
     });
+
+    // #6541: an external MCP client (ZCode) whose model traffic never reaches
+    // this proxy carries no conversationId — arbitrating its id-less call into
+    // the single fresh conversation hands a foreign client another session's
+    // view. MCP-forwarded calls must never take the arbitration rung.
+    it("#6541: id-less MCP-forwarded POST with exactly one fresh conversation refuses to guess", async () => {
+        const a = getSession(`t-6541-mcp-${Math.random().toString(36).slice(2)}`);
+        recordPluginSession(`conv-6541-only-${Math.random().toString(36).slice(2)}`, a.id);
+        const r = await post({ tool: "acp_status", args: {}, agent: "mcp" });
+        assert.equal(r.status, 400);
+        assert.match(String(r.json.error), /refuse to guess/);
+        assert.deepEqual(executedOn(), [], "nothing must execute on the foreign session");
+        assert.ok(!logs.join("\n").includes(a.id), "the foreign session must not even be named as routed");
+    });
+
+    it("#6541: MCP-forwarded POST with a body id still routes by the body id", async () => {
+        const a = getSession(`t-6541-mb-${Math.random().toString(36).slice(2)}`);
+        const r = await post({ conversationId: a.id, tool: "acp_status", args: {}, agent: "mcp" });
+        assert.equal(r.status, 200);
+        assert.deepEqual(executedOn(), [a.id]);
+    });
+
+    it("#6541: MCP-forwarded POST with a unique witness still routes by witness", async () => {
+        const a = getSession(`t-6541-wa-${Math.random().toString(36).slice(2)}`);
+        const b = getSession(`t-6541-wb-${Math.random().toString(36).slice(2)}`);
+        recordToolWitness(a.id, "acp_status", "{}");
+        recordPluginSession(`conv-6541-wit-${Math.random().toString(36).slice(2)}`, b.id);
+        const r = await post({ tool: "acp_status", args: {}, agent: "mcp" });
+        assert.equal(r.status, 200);
+        assert.deepEqual(executedOn(), [a.id]);
+        assert.match(logs.join("\n"), /routed by witness, #1685/);
+    });
 });
 
 describe("#1685 review: duplicate-hash index safety + TTL", () => {
