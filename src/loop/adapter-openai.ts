@@ -361,6 +361,21 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     }
                 }
             };
+            // #5950: some OpenAI-compatible gateways (Zhipu GLM behind a
+            // `new-provider` proxy) stream tool calls with NO id at all —
+            // absorb keeps "" and the settle used to forward it verbatim,
+            // so the loop's server-side continuation replayed an assistant
+            // tool_calls entry AND its tool result with an empty
+            // tool_call_id. That malformed pair is exactly the context a
+            // model "repairs" by emitting a stray call in the next round
+            // (the phantom Read for a nonexistent path in #5950). Mint a
+            // stable per-round id instead; a present upstream id is never
+            // rewritten (wire fidelity, #1039). Raw passthrough replay
+            // keeps the upstream's original bytes untouched — only the
+            // loop's settled record (and therefore the continuation body)
+            // carries the minted id.
+            const settledCallId = (idx: number, tc: { id: string }): string =>
+                tc.id.length > 0 ? tc.id : `call_acp_r${round}_i${idx}`;
             const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
                 for (const [idx, tc] of pending) {
                     if (tc.name.length > 0 || tc.id.length > 0) {
@@ -369,7 +384,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield {
                             kind: "tool_call",
                             name: tc.name,
-                            callId: tc.id,
+                            callId: settledCallId(idx, tc),
                             arguments: tc.arguments,
                         } as ParsedStreamEvent;
                     } else if (tc.arguments.length > 0) {
@@ -402,7 +417,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         const tc = pending.get(idx)!;
                         if (tc.name.length === 0) anyNameless = true;
                         const disp = realIndexes.has(idx) ? "replayed" : tc.name.length === 0 ? "nameless" : "proxy";
-                        parts.push(`idx=${idx} name=${tc.name.length > 0 ? JSON.stringify(tc.name) : "<none>"}${tc.id ? ` id=${tc.id}` : ""} argsLen=${tc.arguments.length} frags=${tc.frags}${tc.nameInFirst === false ? " name-split" : ""} → ${disp}`);
+                        parts.push(`idx=${idx} name=${tc.name.length > 0 ? JSON.stringify(tc.name) : "<none>"} id=${settledCallId(idx, tc)}${tc.id ? "" : " (minted #5950)"} argsLen=${tc.arguments.length} frags=${tc.frags}${tc.nameInFirst === false ? " name-split" : ""} → ${disp}`);
                     }
                     yield {
                         kind: "diag",
@@ -426,7 +441,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield {
                             kind: "tool_call",
                             name: tc.name,
-                            callId: tc.id,
+                            callId: settledCallId(idx, tc),
                             arguments: tc.arguments,
                             passthrough: true,
                         } as ParsedStreamEvent;
@@ -450,7 +465,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield {
                             kind: "tool_call",
                             name: tc.name,
-                            callId: tc.id,
+                            callId: settledCallId(idx, tc),
                             arguments: tc.arguments,
                         } as ParsedStreamEvent;
                     }
