@@ -45,10 +45,20 @@ test("currentCalibrationFactor: invalid factors degrade to absent", () => {
     assert.equal(currentCalibrationFactor({ calibratedEstimate: -0.5 }, "m"), undefined);
 });
 
-test("currentCalibrationFactor: cross-model factors act as absent, missing info keeps them", () => {
-    const st = { calibratedEstimate: 0.5 };
-    // Legacy factor (never recorded a model) or unknown current model — missing
-    // information must NOT invalidate evidence; rollover retires it naturally.
+test("currentCalibrationFactor: cross-model factors act as absent, missing MODEL info keeps them; missing PROVENANCE drops them (#5952)", () => {
+    // #5952 supersedes the #2117 missing-info discipline for the PROVENANCE
+    // dimension only: a factor without the text-only-v1 stamp may have been
+    // trained from mixed-modal samples, and no signal distinguishes a clean
+    // legacy factor from a contaminated one — it acts as absent until fresh
+    // text-only samples re-warm it. The MODEL dimension keeps the #2117
+    // discipline: missing model info never invalidates a STAMPED factor.
+    const legacy = { calibratedEstimate: 0.5 };
+    assert.equal(currentCalibrationFactor(legacy, "gpt-x"), undefined, "unprovenanced legacy factor acts as absent even with a known model");
+    assert.equal(currentCalibrationFactor(legacy, undefined), undefined);
+    const st = { calibratedEstimate: 0.5, calibratedEstimateProvenance: "text-only-v1" };
+    // Stamped factor, legacy (never recorded a model) or unknown current
+    // model — missing information must NOT invalidate evidence; rollover
+    // retires it naturally.
     assert.equal(currentCalibrationFactor(st, "gpt-x"), 0.5);
     assert.equal(currentCalibrationFactor(st, undefined), 0.5);
     assert.equal(currentCalibrationFactor({ ...st, calibratedEstimateModel: "gpt-x" }, undefined), 0.5);
@@ -57,6 +67,8 @@ test("currentCalibrationFactor: cross-model factors act as absent, missing info 
     // Both known and different → absent (the dangerous direction: stale k̂<1
     // would deflate the estimate and delay the trigger on the new model).
     assert.equal(currentCalibrationFactor({ ...st, calibratedEstimateModel: "gpt-x" }, "gpt-y"), undefined);
+    // A bogus provenance value is not the stamp.
+    assert.equal(currentCalibrationFactor({ ...st, calibratedEstimateProvenance: "text-only-v2" }, "gpt-x"), undefined);
 });
 
 type PreparedLike = Parameters<typeof outboundContextEstimates>[0];
@@ -234,11 +246,13 @@ test("resetSessionCompression drops the new provenance/display fields at the bou
     st.calibratedEstimate = 0.7;
     st.calibratedEstimateOrigin = "http://a";
     st.calibratedEstimateModel = "gpt-x";
+    st.calibratedEstimateProvenance = "text-only-v1";
     st.calibrationRing = { origin: "http://a", model: "gpt-x", values: [0.7] };
     st.contextEstimateTokens = 12_000;
     st.contextEstimateCalibrated = true;
     resetSessionCompression(s);
     assert.equal(st.calibratedEstimateModel, undefined);
+    assert.equal(st.calibratedEstimateProvenance, undefined);
     assert.equal(st.calibrationRing, undefined);
     assert.equal(st.contextEstimateTokens, undefined);
     assert.equal(st.contextEstimateCalibrated, undefined);

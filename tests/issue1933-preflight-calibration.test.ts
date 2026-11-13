@@ -186,6 +186,7 @@ test("resetSessionCompression drops calibration + baseline provenance at the com
     st.lastInputTokensOrigin = "http://a";
     st.calibratedEstimate = 0.7;
     st.calibratedEstimateOrigin = "http://a";
+    st.calibratedEstimateProvenance = "text-only-v1";
     st.calibrationRing = { origin: "http://a", values: [0.7] };
     st.lastLocalTextEstimate = 999;
     st.lastLocalTextEstimateOrigin = "http://a";
@@ -193,6 +194,7 @@ test("resetSessionCompression drops calibration + baseline provenance at the com
     assert.equal(st.lastInputTokensOrigin, undefined);
     assert.equal(st.calibratedEstimate, undefined);
     assert.equal(st.calibratedEstimateOrigin, undefined);
+    assert.equal(st.calibratedEstimateProvenance, undefined);
     assert.equal(st.calibrationRing, undefined);
     assert.equal(st.lastLocalTextEstimate, undefined);
     assert.equal(st.lastLocalTextEstimateOrigin, undefined);

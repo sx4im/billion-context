@@ -13,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteFinalWireCalibrationFacts, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
@@ -1154,6 +1154,19 @@ async function forwardCaptured(
             scaledText,
             imageTokens: est.imageTokens,
             calibrated: scaledText !== est.textOverhead,
+        });
+        // #5952: this send's own final-wire calibration facts — the text-only
+        // estimate of the body just sent (est.textOverhead excludes the image
+        // reserve), its image mass, the route, and the model read off the
+        // single shared parse (body first, the prepare lane's resolved model
+        // as the fallback for wires that carry the model in the URL path).
+        // The next settle pairs usage against these instead of the shared
+        // prepare stats.
+        noteFinalWireCalibrationFacts(prepared.session, {
+            textEstimate: est.textOverhead,
+            imageTokens: est.imageTokens,
+            origin: normalizeUpstreamOrigin(upstreamUrl),
+            model: typeof sentParsed?.model === "string" && sentParsed.model !== "" ? sentParsed.model : prepared.model,
         });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").

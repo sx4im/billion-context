@@ -584,11 +584,22 @@ export type Session = {
           *  Absent on factors published before this field existed → reads
           *  treat it as compatible and retire it through normal rollover. */
          calibratedEstimateModel?: string;
+         /** #5952: sample-nature provenance of calibratedEstimate — the
+          *  third provenance dimension. Only "text-only-v1" (published from
+          *  text-only samples, or adopted by a ring whose admitted samples
+          *  are text-only) lets the read gate apply the factor; a factor
+          *  without it is legacy evidence that may be mixed-modal and acts
+          *  as absent until fresh text-only samples re-warm it. */
+         calibratedEstimateProvenance?: string;
          /** #1933 F1 / #2117 B: evidence ring behind calibratedEstimate —
           *  the recent admitted raw samples for ONE origin+model (max 3).
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
-          *  native-compaction boundaries with the rest of the baseline stats. */
-         calibrationRing?: { origin: string; model?: string; values: number[] };
+          *  native-compaction boundaries with the rest of the baseline stats.
+          *  #5952: provenance adopts "text-only-v1" on the first post-fix
+          *  text-only admission (same adoption discipline as the model key);
+          *  a ring without it is legacy evidence whose samples may be
+          *  mixed-modal. */
+         calibrationRing?: { origin: string; model?: string; values: number[]; provenance?: string };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate;
@@ -1769,6 +1780,8 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
     delete session.stats.calibratedEstimateModel;
+    // #5952: same boundary — the factor's sample-nature provenance dies too.
+    delete session.stats.calibratedEstimateProvenance;
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;

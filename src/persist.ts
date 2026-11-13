@@ -45,6 +45,7 @@ import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
+import { CALIBRATION_TEXT_ONLY_PROVENANCE } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
 /**
@@ -207,7 +208,8 @@ interface PersistedSession {
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
-        calibrationRing?: { origin: string; values: number[] };
+        calibratedEstimateProvenance?: string;
+        calibrationRing?: { origin: string; values: number[]; provenance?: string };
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -4083,14 +4085,20 @@ function restoreCalibratedEstimate(v: unknown): number | undefined {
 // itself would admit (finite, within the plausibility band) and only the newest
 // window-size entries; anything else drops the ring wholesale so a malformed
 // file can neither teach a factor nor mask a fresh learning run on restart.
-function restoreCalibrationRing(v: unknown): { origin: string; values: number[] } | undefined {
+// #5952: the ring's provenance survives only as the exact text-only-v1 stamp
+// — any other value is a hand-edited or future-version marker the read gate
+// would not trust anyway, so it drops and the ring re-adopts on next admission.
+function restoreCalibrationRing(v: unknown): { origin: string; values: number[]; provenance?: string } | undefined {
     if (!v || typeof v !== "object") return undefined;
-    const ring = v as { origin?: unknown; values?: unknown };
+    const ring = v as { origin?: unknown; values?: unknown; provenance?: unknown };
     if (typeof ring.origin !== "string" || ring.origin.length === 0) return undefined;
     if (!Array.isArray(ring.values)) return undefined;
     const values = ring.values.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= CALIBRATION_SAMPLE_MIN && x <= CALIBRATION_SAMPLE_MAX);
     const recent = values.slice(-CALIBRATION_SAMPLE_WINDOW);
-    return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
+    if (recent.length === 0) return undefined;
+    return ring.provenance === CALIBRATION_TEXT_ONLY_PROVENANCE
+        ? { origin: ring.origin, values: recent, provenance: CALIBRATION_TEXT_ONLY_PROVENANCE }
+        : { origin: ring.origin, values: recent };
 }
 
 function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
@@ -4176,6 +4184,10 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
+            // #5952: the factor's provenance restores only as the exact stamp —
+            // a legacy file has none, so its factor acts as absent until fresh
+            // text-only samples re-warm it (see currentCalibrationFactor).
+            calibratedEstimateProvenance: stats.calibratedEstimateProvenance === CALIBRATION_TEXT_ONLY_PROVENANCE ? CALIBRATION_TEXT_ONLY_PROVENANCE : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the

@@ -124,6 +124,14 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
     return raw * k;
 }
 
+/** #5952: provenance stamp for the learned estimator scale — a factor
+ *  published from text-only samples only. Factors published before this
+ *  stamp existed (or restored from files predating it) carry no provenance
+ *  and the read gate below treats them as absent: a mixed-modal sample may
+ *  have trained them, and no signal distinguishes a clean legacy factor
+ *  from a contaminated one. They re-warm from fresh text-only samples. */
+export const CALIBRATION_TEXT_ONLY_PROVENANCE = "text-only-v1";
+
 /** #2117: read-side gate for the learned estimator scale — the model dimension
  *  of k̂ provenance. A factor published against model X must not decide on
  *  model Y: tokenizers bill differently, and a stale cross-model factor can be
@@ -133,10 +141,16 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
  *  string → factor kept as-is, so factors published before this field existed
  *  (or requests without a model stamp) are never invalidated by missing
  *  information — they retire through the normal ring rollover when new samples
- *  land. Invalid factors degrade to absent. */
-export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string }, lastModel?: unknown): number | undefined {
+ *  land. #5952 adds the third provenance dimension: the factor must carry the
+ *  text-only-v1 stamp (image-bearing samples never train it). Missing
+ *  provenance DOES invalidate — unlike the model dimension, a legacy factor
+ *  cannot prove its samples were text-only, and the #5952 incident is a
+ *  stale mixed-modal multiplier rejecting a fitting payload. Invalid factors
+ *  degrade to absent. */
+export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string; calibratedEstimateProvenance?: string }, lastModel?: unknown): number | undefined {
     const k = stats.calibratedEstimate;
     if (k === undefined || !Number.isFinite(k) || k <= 0) return undefined;
+    if (stats.calibratedEstimateProvenance !== CALIBRATION_TEXT_ONLY_PROVENANCE) return undefined;
     if (stats.calibratedEstimateModel !== undefined && typeof lastModel === "string" && lastModel !== "" && stats.calibratedEstimateModel !== lastModel) return undefined;
     return k;
 }

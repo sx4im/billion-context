@@ -11,7 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { normalizeUpstreamOrigin } from "../src/util.ts";
+import { CALIBRATION_TEXT_ONLY_PROVENANCE, normalizeUpstreamOrigin } from "../src/util.ts";
 
 // #4185: an identified fresh session whose preflight ends in deterministic
 // exhaustion now forwards once for upstream arbitration instead of failing
@@ -191,6 +191,9 @@ function seedCalibratedSession(sessionId: string, upstreamPort: number): void {
     const s = getSession(sessionId);
     s.stats.calibratedEstimate = K;
     s.stats.calibratedEstimateOrigin = `http://127.0.0.1:${upstreamPort}`; // == currentOrigin → ×K applies
+    // #5952: the fixture pins a factor that must APPLY, so it carries the
+    // text-only-v1 stamp (a legacy unprovenanced factor acts as absent).
+    s.stats.calibratedEstimateProvenance = CALIBRATION_TEXT_ONLY_PROVENANCE;
 }
 
 test("#3645: matching-origin k̂>1 no longer skips a raw fold that fits the window", async () => {

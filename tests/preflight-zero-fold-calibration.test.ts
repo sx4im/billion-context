@@ -9,6 +9,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { outboundPayloadBreakdown, preflightCompressIfNeeded, type Prepared } from "../src/server.ts";
+import { CALIBRATION_TEXT_ONLY_PROVENANCE } from "../src/util.ts";
 import { _liveUpstreamTimersForTest, _resetFetchUtilForTest } from "../src/fetch-util.ts";
 
 process.env.NODE_ENV = "test";
@@ -90,6 +91,10 @@ async function run(s: Scenario) {
     session.stats.calibratedEstimate = s.k;
     session.stats.calibratedEstimateOrigin = s.otherOrigin ? "http://other.invalid" : origin;
     session.stats.calibratedEstimateModel = s.otherModel ? "another-model" : "test-model";
+    // #5952: the fixture pins a factor that must APPLY, so it carries the
+    // text-only-v1 stamp — the origin/model mismatch rows stay meaningful
+    // (the factor is rejected for the mismatch, not for missing provenance).
+    session.stats.calibratedEstimateProvenance = CALIBRATION_TEXT_ONLY_PROVENANCE;
     session.metadata.lastModel = "test-model";
     if (s.localRefusal) session.metadata.localRefusals = [{ origin, model: "test-model", window: limit, at: Date.now() }];
     // Keep the normal no-ranges shortcut out of the way: this is the caller's

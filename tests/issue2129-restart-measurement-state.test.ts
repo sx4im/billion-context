@@ -64,7 +64,8 @@ test("measurement-state stats survive a reload round-trip (#2129)", async () => 
         st.lastInputTokensOrigin = "http://127.0.0.1:8787";
         st.calibratedEstimate = 0.4375;
         st.calibratedEstimateOrigin = "http://127.0.0.1:8787";
-        st.calibrationRing = { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48] };
+        st.calibratedEstimateProvenance = "text-only-v1";
+        st.calibrationRing = { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48], provenance: "text-only-v1" };
         st.lastInputTokens = 4321;
         st.wholeBlockRestores = 3;
         await store.writeNow(s);
@@ -77,7 +78,8 @@ test("measurement-state stats survive a reload round-trip (#2129)", async () => 
         assert.equal(back.stats.lastInputTokensOrigin, "http://127.0.0.1:8787", "lastInputTokensOrigin round-trips");
         assert.equal(back.stats.calibratedEstimate, 0.4375, "calibratedEstimate round-trips");
         assert.equal(back.stats.calibratedEstimateOrigin, "http://127.0.0.1:8787", "calibratedEstimateOrigin round-trips");
-        assert.deepEqual(back.stats.calibrationRing, { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48] }, "calibrationRing round-trips");
+        assert.equal(back.stats.calibratedEstimateProvenance, "text-only-v1", "calibratedEstimateProvenance round-trips (#5952)");
+        assert.deepEqual(back.stats.calibrationRing, { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48], provenance: "text-only-v1" }, "calibrationRing round-trips");
         assert.equal(back.stats.lastInputTokens, 4321, "control counter still round-trips");
         assert.equal(back.stats.wholeBlockRestores, 3, "control counter still round-trips");
     } finally {
@@ -152,6 +154,7 @@ test("corrupt persisted measurement values are rejected at restore (#2129)", asy
             st.localInputEstimate = -1;
             st.lastUsageGradeTokens = -5;
             st.calibratedEstimateOrigin = "  ";
+            st.calibratedEstimateProvenance = "bogus";
             st.lastInputTokensOrigin = "";
         });
         assert.equal(bad.stats.calibratedEstimate, undefined, "out-of-band k̂ rejected");
@@ -159,6 +162,7 @@ test("corrupt persisted measurement values are rejected at restore (#2129)", asy
         assert.equal(bad.stats.localInputEstimate, undefined, "negative estimate rejected");
         assert.equal(bad.stats.lastUsageGradeTokens, undefined, "negative anchor rejected");
         assert.equal(bad.stats.calibratedEstimateOrigin, undefined, "blank origin rejected");
+        assert.equal(bad.stats.calibratedEstimateProvenance, undefined, "bogus provenance rejected (#5952)");
         assert.equal(bad.stats.lastInputTokensOrigin, undefined, "empty origin rejected");
 
         // A malformed ring keeps only samples the learner itself would admit
