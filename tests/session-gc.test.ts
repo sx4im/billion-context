@@ -15,7 +15,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
-import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, SessionStemIndex, viewFromParsed } from "../src/session-gc.js";
 import { restoreExportDirName } from "../src/image-restore.js";
 
 const DAY = 86_400_000;
@@ -518,6 +518,75 @@ test("gcSessionFiles: orphaned content stores are swept once old, fresh ones kep
         assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
         assert.ok(!existsSync(fOld), "aged orphan swept");
         assert.ok(existsSync(fFresh), "fresh orphan kept (still inside any resume window)");
+    });
+});
+
+test("SessionStemIndex: suffix matches equal the naive basename scan, in walk order (#6609)", () => {
+    const files = [
+        "anthropic/api.example.com_deadbeefcafe1234.json",
+        "_unknown/deadbeefcafe1234.json",
+        "anthropic/host_abc.json",
+        "_unknown/abc.json",
+        "anthropic/ünïcode_☃.json",
+        "_unknown/☃.json",
+        "anthropic/emoji_😀.json",
+        "anthropic/other.json",
+        "anthropic/host_deadbeefcafe1234.json",
+    ];
+    const index = new SessionStemIndex(files);
+    // The naive predicate is the exact check the sweep used before the index:
+    // a session matches a stem when its basename ends with stem + ".json".
+    const stems = ["deadbeefcafe1234", "api.example.com_deadbeefcafe1234", "abc", "host_abc", "☃", "ünïcode_☃", "😀", "cafe1234", "1234", "other", "nope", ""];
+    for (const stem of stems) {
+        const naive = files.filter((f) => path.basename(f).endsWith(stem + ".json"));
+        assert.deepEqual(index.find(stem), naive, `stem ${JSON.stringify(stem)}`);
+    }
+    // Repeat lookups are stable and walk-ordered.
+    assert.deepEqual(index.find("abc"), ["anthropic/host_abc.json", "_unknown/abc.json"]);
+    assert.deepEqual(index.find("1234"), [
+        "anthropic/api.example.com_deadbeefcafe1234.json",
+        "_unknown/deadbeefcafe1234.json",
+        "anthropic/host_deadbeefcafe1234.json",
+    ]);
+});
+
+test("gcSessionFiles: 500 recent sessions + 500 old cross-namespace companions, all kept (#6609)", async () => {
+    const dir = tmpDir("bili-gc-scale-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const N = 500;
+        for (let i = 0; i < N; i++) {
+            const stem = `h${String(i).padStart(4, "0")}`;
+            writeFile(dir, `anthropic/host_${stem}.json`, JSON.stringify(envelope(`gc-scale-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+            contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 800, 10);
+        }
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.equal(res.kept, 2 * N, JSON.stringify(res));
+    });
+});
+
+test("gcSessionFiles: 200 stale duplicates keep their companions while namespaced twins rely on them (#6609)", async () => {
+    const dir = tmpDir("bili-gc-scale-twin-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const N = 200;
+        for (let i = 0; i < N; i++) {
+            const stem = `d${String(i).padStart(4, "0")}`;
+            writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-scale-twin-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+            writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-scale-twin-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+            contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 800, 10);
+        }
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, N, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        for (let i = 0; i < N; i++) {
+            const stem = `d${String(i).padStart(4, "0")}`;
+            assert.ok(!existsSync(path.join(dir, `_unknown/${stem}.json`)), `duplicate ${stem} deleted`);
+            assert.ok(existsSync(path.join(dir, `anthropic/api.example.com_${stem}.json`)), `twin ${stem} kept`);
+            assert.ok(existsSync(path.join(dir, `_unknown/${stem}.content-store.json`)), `live fallback store ${stem} kept`);
+        }
     });
 });
 

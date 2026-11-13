@@ -191,6 +191,55 @@ interface GcResult {
     imgDirsRemoved: number;
 }
 
+/** Reverse a string by code point, so astral characters (surrogate pairs)
+ *  stay intact — a UTF-16-unit reversal would split them and corrupt the
+ *  prefix test below. */
+function reverseCodePoints(s: string): string {
+    return [...s].reverse().join("");
+}
+
+/**
+ * Per-sweep suffix lookup over session-file basenames (#6609). The sweep
+ * matches companions to sessions by suffix — a session basename matches a
+ * stem when it ends with stem + ".json" (cross-namespace twins share only
+ * the hash tail) — and the old code re-scanned every session file per
+ * companion, so the orphan check grew as sessions x companions. This index
+ * sorts the reversed stems once, lazily on first use, and answers each
+ * lookup with a binary search; matches come back in the original
+ * filesystem-walk order, and callers still apply the deleted-session and
+ * readable-own-store checks themselves, so every policy is unchanged. */
+export class SessionStemIndex {
+    private sorted: { reversed: string; order: number }[] | null = null;
+
+    constructor(private readonly files: string[]) {}
+
+    /** Session files whose basename stem ends with `stem`, in walk order. */
+    find(stem: string): string[] {
+        if (this.sorted === null) {
+            this.sorted = this.files.map((file, order) => ({
+                reversed: reverseCodePoints(path.basename(file, ".json")),
+                order,
+            })).sort((a, b) => (a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : a.order - b.order));
+        }
+        const needle = reverseCodePoints(stem);
+        let lo = 0;
+        let hi = this.sorted.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (this.sorted[mid].reversed < needle) lo = mid + 1;
+            else hi = mid;
+        }
+        const hits: { file: string; order: number }[] = [];
+        for (let i = lo; i < this.sorted.length; i++) {
+            const entry = this.sorted[i];
+            if (!entry.reversed.startsWith(needle)) break;
+            hits.push({ file: this.files[entry.order], order: entry.order });
+        }
+        hits.sort((a, b) => a.order - b.order);
+        return hits.map((hit) => hit.file);
+    }
+}
+
 export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number; imgRoot?: string }): Promise<GcResult> {
     const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0, imgDirsRemoved: 0 };
     const cfg = gcConfigFromEnv();
@@ -216,6 +265,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     }
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
+    // #6609: the twin guard and the orphan pass both match companions to
+    // sessions by basename suffix; the lookup is built lazily on first use
+    // so sweeps with no companions to match pay nothing for it.
+    const stemIndex = new SessionStemIndex(sessionFiles);
     for (const file of sessionFiles) {
         let st;
         try {
@@ -316,9 +369,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of stemIndex.find(stem)) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -370,12 +422,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of stemIndex.find(stem)) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;
