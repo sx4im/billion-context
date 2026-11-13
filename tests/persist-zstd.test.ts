@@ -48,31 +48,37 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
 interface Harness {
     dir: string;
     logs: LogLine[];
+    stores: SessionStore[];
 }
 
 async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Promise<void> {
     await test(name, async () => {
         const dir = mkdtempSync(join(tmpdir(), "bili-zstd-"));
         const logs: LogLine[] = [];
-        const h = { dir, logs };
+        const h = { dir, logs, stores: [] as SessionStore[] };
         try {
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
+            // Windows cannot delete index.db while a store still holds it
+            // (#6547): close every store created in this test before rmrf.
+            for (const s of h.stores) s.closeQuietly();
             rmrf(dir);
         }
     });
 }
 
 function newStore(h: Harness, debounceMs = 0): SessionStore {
-    return new SessionStore({
+    const store = new SessionStore({
         dir: h.dir,
         debounceMs,
         enabled: true,
         log: (level, msg) => h.logs.push({ level, msg }),
     });
+    h.stores.push(store);
+    return store;
 }
 
 function filePath(dir: string, id: string): string {

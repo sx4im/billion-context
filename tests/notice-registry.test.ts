@@ -17,6 +17,19 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+// This suite asserts on the sqlite-default notice, which only fires under
+// the default storage posture — clear the storage knobs inherited from the
+// test-runner baseline (preload-storage-baseline.mjs pins legacy), same
+// discipline as tests/sqlite-default-notice.test.ts (#6547).
+for (const k of [
+    "BILI_STORAGE_UNIFIED",
+    "BILI_STORAGE_JSON_WRITER",
+    "BILI_STORAGE_BACKEND",
+    "BILI_ENCRYPTION_KEY",
+    "BILI_PERSIST",
+]) {
+    delete process.env[k];
+}
 
 const { NOTICES, visibleNotices, SQLITE_DEFAULT_NOTICE_ID } = await import("../src/notices.ts");
 const { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissUpgradeNotice } = await import("../src/pck-notice.ts");
