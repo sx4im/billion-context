@@ -180,6 +180,54 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
     return out;
 }
 
+/** Reverse a string by UTF-16 code unit (#6609). Reversal is a bijection on
+ * code-unit sequences, so "basename ends with suffix" is exactly
+ * "reversed(basename) starts with reversed(suffix)" — no assumption about
+ * hash length or filename separator, and Unicode names (including astral
+ * characters) match exactly. */
+function reverseString(s: string): string {
+    return s.split("").reverse().join("");
+}
+
+/** Per-sweep suffix lookup over session-file basenames (#6609). The twin
+ * guard and the orphan pass used to rescan every session file per companion
+ * (sessions x companions); a sorted index of reversed basenames answers an
+ * arbitrary suffix query in O(log n + matches). Candidates come back in
+ * original filesystem-walk order, so probe behavior is unchanged. */
+export interface SessionSuffixIndex {
+    /** Session files whose basename ends with `suffix`, in original walk order. */
+    find(suffix: string): string[];
+}
+
+export function createSessionSuffixIndex(sessionFiles: readonly string[]): SessionSuffixIndex {
+    const entries = sessionFiles.map((file, index) => ({
+        reversed: reverseString(path.basename(file)),
+        index,
+        file,
+    }));
+    entries.sort((a, b) => (a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : 0));
+    return {
+        find(suffix: string): string[] {
+            const needle = reverseString(suffix);
+            let lo = 0;
+            let hi = entries.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (entries[mid].reversed < needle) lo = mid + 1;
+                else hi = mid;
+            }
+            const matches: { index: number; file: string }[] = [];
+            for (let i = lo; i < entries.length; i++) {
+                const entry = entries[i];
+                if (!entry.reversed.startsWith(needle)) break;
+                matches.push(entry);
+            }
+            matches.sort((a, b) => a.index - b.index);
+            return matches.map((m) => m.file);
+        },
+    };
+}
+
 interface GcResult {
     removed: number;
     kept: number;
@@ -214,6 +262,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (f.endsWith(companionSuffix)) companions.push(f);
         else sessionFiles.push(f);
     }
+    // #6609: suffix lookup over session basenames, built lazily on the first
+    // companion match — sweeps with no companions never pay for the index.
+    let suffixIndex: SessionSuffixIndex | null = null;
+    const suffixLookup = (): SessionSuffixIndex => (suffixIndex ??= createSessionSuffixIndex(sessionFiles));
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
     for (const file of sessionFiles) {
@@ -316,9 +368,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of suffixLookup().find(stem + ".json")) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -370,12 +421,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of suffixLookup().find(stem + ".json")) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;

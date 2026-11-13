@@ -15,7 +15,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
-import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { contentStoreTokens, createSessionSuffixIndex, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
 import { restoreExportDirName } from "../src/image-restore.js";
 
 const DAY = 86_400_000;
@@ -647,6 +647,105 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             await closeServer(upstream);
             _setStoreForTest(new SessionStore({ enabled: false }));
         }
+    });
+});
+
+test("createSessionSuffixIndex: arbitrary suffixes in walk order, no fixed hash length (#6609)", () => {
+    const files = [
+        "anthropic/host_abc.json",
+        "openai/abc.json",
+        "anthropic/ghost_abc.json",
+        "anthropic/other.json",
+        "_unknown/xyz.json",
+    ];
+    const idx = createSessionSuffixIndex(files);
+    // "abc.json" is a suffix of three different basenames — all three, walk order.
+    assert.deepEqual(idx.find("abc.json"), ["anthropic/host_abc.json", "openai/abc.json", "anthropic/ghost_abc.json"]);
+    // A longer stem narrows to the namespaced twins only (ghost_abc still matches: it ends with host_abc.json).
+    assert.deepEqual(idx.find("host_abc.json"), ["anthropic/host_abc.json", "anthropic/ghost_abc.json"]);
+    assert.deepEqual(idx.find("xyz.json"), ["_unknown/xyz.json"]);
+    assert.deepEqual(idx.find("other.json"), ["anthropic/other.json"]);
+    assert.deepEqual(idx.find("missing.json"), []);
+});
+
+test("createSessionSuffixIndex: Unicode names match exactly, including astral characters (#6609)", () => {
+    const files = [
+        "anthropic/café_☃.json",
+        "openai/café_☃.json",
+        "anthropic/smile_😀.json",
+        "anthropic/plain.json",
+    ];
+    const idx = createSessionSuffixIndex(files);
+    assert.deepEqual(idx.find("café_☃.json"), ["anthropic/café_☃.json", "openai/café_☃.json"]);
+    assert.deepEqual(idx.find("☃.json"), ["anthropic/café_☃.json", "openai/café_☃.json"]);
+    // Astral-plane emoji is a surrogate pair in UTF-16 — code-unit reversal keeps the match exact.
+    assert.deepEqual(idx.find("smile_😀.json"), ["anthropic/smile_😀.json"]);
+    assert.deepEqual(idx.find("😀.json"), ["anthropic/smile_😀.json"]);
+    assert.deepEqual(idx.find("plain.json"), ["anthropic/plain.json"]);
+});
+
+test("gcSessionFiles: stale duplicate keeps its companion when the twin's own store is unreadable (#6609)", async () => {
+    const dir = tmpDir("bili-gc-twinbad-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const stem = "twinbadcafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twinbad-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-twinbad-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        // The twin's own store exists but is not a recognizable envelope —
+        // loadContentStore falls through to the _unknown/ sibling, so the
+        // stale duplicate's store stays the twin's live store.
+        const fBad = writeFile(dir, `anthropic/api.example.com_${stem}.content-store.json`, "{not json", 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fDup));
+        assert.ok(existsSync(fTwin));
+        assert.ok(existsSync(fCmp), "unreadable twin store means the fallback sibling is still live");
+        assert.ok(existsSync(fBad));
+    });
+});
+
+test("gcSessionFiles: Unicode session names pair with their companions (#6609)", async () => {
+    const dir = tmpDir("bili-gc-unicode-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const stem = "café_😀_1234";
+        const fSess = writeFile(dir, `anthropic/host_${stem}.json`, JSON.stringify(envelope(`gc-uni-${stem}`, oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fCmp = contentStoreFile(dir, `anthropic/host_${stem}.content-store.json`, 100, 10);
+        const fOrph = contentStoreFile(dir, "anthropic/orphan_😀_9999.content-store.json", 100, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 2, JSON.stringify(res));
+        assert.ok(!existsSync(fSess));
+        assert.ok(!existsSync(fCmp), "Unicode companion co-deleted with its session");
+        assert.ok(!existsSync(fOrph), "unrelated Unicode orphan swept");
+    });
+});
+
+test("gcSessionFiles: many unrelated orphans are swept while referenced companions survive (#6609)", async () => {
+    const dir = tmpDir("bili-gc-orphscale-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // 200 live sessions, each with a referenced companion.
+        const liveCompanions: string[] = [];
+        for (let i = 0; i < 200; i++) {
+            const stem = `live${String(i).padStart(4, "0")}abcdef`;
+            writeFile(dir, `anthropic/host_${stem}.json`, JSON.stringify(envelope(`gc-scale-live-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+            liveCompanions.push(contentStoreFile(dir, `anthropic/host_${stem}.content-store.json`, 100, 10));
+        }
+        // 200 unrelated orphan companions — stems no session shares.
+        const orphans: string[] = [];
+        for (let i = 0; i < 200; i++) {
+            const stem = `orph${String(i).padStart(4, "0")}fedcba`;
+            orphans.push(contentStoreFile(dir, `anthropic/host_${stem}.content-store.json`, 100, 10));
+        }
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 200, JSON.stringify(res));
+        for (const f of orphans) assert.ok(!existsSync(f), `orphan swept: ${f}`);
+        for (const f of liveCompanions) assert.ok(existsSync(f), `referenced companion kept: ${f}`);
     });
 });
 
