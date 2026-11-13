@@ -9,7 +9,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteCalibrationPair, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import type { SeparatorSlot } from "../server/responses-ordering.js";
@@ -664,6 +664,25 @@ export async function* runCompressLoop(
                     fp: ctx.imageLearn.fp,
                 });
             }
+        }
+        // #5952: note this round's own final-wire calibration pair — the
+        // same text-side estimate as the image facts above, with the round's
+        // own image count, route and model, so the round's usage settle pairs
+        // with the payload IT sent instead of the shared prepare-time slot.
+        // Last note wins in the capture, and each round's settle consumes
+        // its pair before the next round sends (recordUsage runs once per
+        // round, before the next fetchUpstream), so rounds cannot cross-pair;
+        // a same-round retry re-issues byte-identical bodies, so its pair
+        // describes the replaced attempt's payload exactly.
+        if (ctx.protocol) {
+            noteCalibrationPair(ctx.session, {
+                estimate: estimateCoreMessages(coreMessages) + estimateWireOverhead(ctx.protocol, wireBodyStr),
+                nImages: wireShedRewrote
+                    ? countImagesInRawBody(ctx.protocol, wireBodyStr)
+                    : countImagesInParsedBody(ctx.protocol, wireObj),
+                origin: requestOptions.url,
+                model: requestModel,
+            });
         }
         // N3 (PR #4725 round-3 review): the loop lane's own sends (compression
         // re-requests, round-2+ rebuilds) were invisible to the 429 governor —

@@ -10,7 +10,7 @@ import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
-import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
+import type { CalibrationPair, InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
 import type { UnpromptedGateState } from "./unprompted-gate.js";
@@ -318,6 +318,13 @@ export type Session = {
          *  bili's rebuild. */
         inBody?: InboundSlot;
         settledInBody?: InboundSlot;
+        /** #5952 (cache-ledger): the in-flight request's own final-wire
+         *  calibration pair, noted at the send chokepoint when the settle
+         *  runs outside withCacheCapture — the AsyncLocalStorage capture is
+         *  the primary home, this is the fallback slot. Consumed exactly
+         *  once by the next settle; a pair noted in the capture never lands
+         *  here. In-memory only. */
+        calibrationPair?: CalibrationPair;
         /** #4805: the conversation's latest ADMITTED message id — the single
          *  needle the settle-side membership probe tests each resent history
          *  against. Updated only by member / first-turn / main-scale

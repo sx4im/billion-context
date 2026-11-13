@@ -13,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteCalibrationPair, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
@@ -1155,6 +1155,25 @@ async function forwardCaptured(
             imageTokens: est.imageTokens,
             calibrated: scaledText !== est.textOverhead,
         });
+        // #5952: note this send's own final-wire calibration pair — the
+        // text-only estimate (est.textOverhead: messages + wire overhead, NO
+        // image reserve) of the exact bytes just sent, with the same
+        // payload's image count, route and model, so the next usage settle
+        // pairs billed usage with THIS request instead of the shared
+        // prepare-time slot (which carries the image reserve and can be
+        // overwritten by a concurrent request before settlement). Only when
+        // the payload parses: an unparseable body carries no reliable image
+        // count, and a pair that undercounts images would train the text
+        // multiplier on image mass — fall back to the legacy shared slot
+        // instead. The image count mirrors the #1843 block above (raw-body
+        // count when a pre-send shed rewrote the bytes).
+        if (sentParsed !== null) {
+            const nImages = outboundCopyRewritten
+                ? countImagesInRawBody(prepared.protocol, sentBody)
+                : countImagesInParsedBody(prepared.protocol, sentParsed);
+            const model = typeof sentParsed.model === "string" && sentParsed.model !== "" ? sentParsed.model : prepared.model;
+            noteCalibrationPair(prepared.session, { estimate: est.textOverhead, nImages, origin: upstreamUrl, model });
+        }
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;

@@ -506,6 +506,27 @@ function originEvidenceJson(m: CoreMessage): string {
 // session.transient slot — the second forward's evidence clobbered the first's
 // before settle. Pending evidence now lives in an AsyncLocalStorage capture;
 // session.transient remains the fallback for callers outside the wrapper.
+// #5952: a request's own final-wire calibration pair — the text-only estimate
+// of the exact payload just sent, with its image count, route and model.
+// Carried in the AsyncLocalStorage capture (or the session.transient fallback
+// outside the wrapper) so settlement pairs billed usage with THIS request's
+// own estimate instead of the shared prepare-time slot
+// (lastLocalTextEstimate), which is written at prepare WITH the image reserve
+// included and can be overwritten by a concurrent request before this one
+// settles. Image-bearing pairs never train the text multiplier — their billed
+// mass includes image tokens the text estimate never counted (that mass is
+// learned separately by #1843's per-image EMA).
+export interface CalibrationPair {
+    /** Text-only final-wire estimate (messages + wire overhead, NO image reserve). */
+    estimate: number;
+    /** Images in the forwarded payload — a pair with nImages > 0 never trains. */
+    nImages: number;
+    /** Upstream URL the payload was sent to (normalized at ingest). */
+    origin?: string;
+    /** Model that served the request (wire `model` field, else the prepared model). */
+    model?: string;
+}
+
 type Capture = {
     session: Session;
     requestId: string;
@@ -513,6 +534,7 @@ type Capture = {
     sentBody?: SeamSlot;
     inBody?: InboundSlot;
     imageFacts?: ForwardedImageFacts;
+    calibrationPair?: CalibrationPair;
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureOrder = 0;
@@ -530,6 +552,7 @@ export async function withCacheCapture<T>(session: Session | undefined, fn: () =
                 delete capture.sentBody;
                 delete capture.inBody;
                 delete capture.imageFacts;
+                delete capture.calibrationPair;
             }
         }
     });
@@ -555,6 +578,31 @@ export function lastForwardedBody(session: Session): SeamSlot | undefined {
 export function pendingEvidencePair(session: Session): { sentBody?: SeamSlot; inBody?: InboundSlot } {
     const pending = pendingCapture(session);
     return { sentBody: pending.sentBody, inBody: pending.inBody };
+}
+
+/** #5952: note the in-flight request's own final-wire calibration pair — call
+ *  at the send chokepoint with the exact payload's text-only estimate, image
+ *  count, route and model. Lives in the AsyncLocalStorage capture (or the
+ *  session.transient fallback outside withCacheCapture, same resolution as
+ *  pendingCapture); the next settle consumes it exactly once. This replaces
+ *  the shared prepare-time slot (lastLocalTextEstimate) as the pairing
+ *  source — that slot is written at prepare WITH the image reserve included
+ *  and can be overwritten by a concurrent request before this one settles,
+ *  so settlement paired billed usage against another request's estimate. */
+export function noteCalibrationPair(session: Session, pair: CalibrationPair): void {
+    pendingCapture(session).calibrationPair = pair;
+}
+
+/** Take (and consume) the pending pair for this session, if any — capture
+ *  first, transient fallback second. A pair trains at most once: image-bearing
+ *  or not, it is gone after the first settle reads it, so a later report can
+ *  never re-pair against it — and a capture aborted mid-flight drops its pair
+ *  in withCacheCapture's finally instead of leaking it into the next forward. */
+function takeCalibrationPair(session: Session): CalibrationPair | undefined {
+    const pending = pendingCapture(session);
+    const pair = pending.calibrationPair;
+    if (pair !== undefined) delete pending.calibrationPair;
+    return pair;
 }
 
 /** #3023: capture side of the inbound pair — call at the send chokepoint
@@ -1760,8 +1808,21 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const settleOrigin = normalizeUpstreamOrigin(upstream);
     const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
     const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-    const pendingEst = session.stats.lastLocalTextEstimate;
-    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    // #5952: prefer the request's own final-wire pair (capture, else the
+    // transient fallback) over the shared prepare-time slot — the pair is the
+    // text-only estimate of the exact payload this report bills, noted at the
+    // send chokepoint with its own origin/model, so a concurrent request can
+    // no longer overwrite the pairing evidence before settlement. An
+    // image-bearing pair never trains the TEXT multiplier: its billed mass
+    // includes image tokens the text estimate never counted, so the ratio
+    // would poison the ring (that mass is learned separately by #1843's
+    // per-image EMA). The pair is consumed either way — a settle reads it
+    // exactly once. Lanes that never note a pair keep the legacy shared-slot
+    // path below, unchanged.
+    const pair = takeCalibrationPair(session);
+    if (pair !== undefined && pair.nImages > 0) return;
+    const pendingEst = pair !== undefined ? pair.estimate : session.stats.lastLocalTextEstimate;
+    const pendingOrigin = pair !== undefined ? normalizeUpstreamOrigin(pair.origin) : normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
         const rawSample = billed / pendingEst;
         // #2117 B: the ring is keyed by route AND model — tokenizers bill
@@ -1773,8 +1834,10 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         // whose load whitelist drops the model fields (#2141) — continues
         // and ADOPTS the first known model. Discarding it would clear a
         // provenance-matched published k̂ on the first post-restart settle
-        // (the #2129 regression class).
-        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        // (the #2129 regression class). #5952: the pair's own model stamp
+        // wins over metadata.lastModel — the model that served THIS request,
+        // not whatever the session last recorded.
+        const settleModel = pair?.model ?? (typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined);
         let ring = session.stats.calibrationRing;
         if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
             ring = { origin: settleOrigin, model: settleModel, values: [] };
