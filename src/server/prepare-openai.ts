@@ -138,6 +138,19 @@ export async function prepareOpenai(
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
+            // #6752: handle.ts already ran restoreOutputBudget on `parsed`
+            // before prepare — its mutation lives ONLY in that object.
+            // Rebuilding `parsed` from the raw bodyText spans below would
+            // silently discard the restored budget (the forwarded body would
+            // carry the client's starved value while the log reports
+            // success). Carry the budget field across the rebuild. Inline
+            // field selection (same priority as the budget reader) — this
+            // module must stay decoupled from the side-lane engine (#1440).
+            const budgetField = (["max_tokens", "max_completion_tokens", "max_output_tokens"] as const).find(
+                (f) => typeof (parsed as Record<string, unknown>)[f] === "number" && ((parsed as Record<string, unknown>)[f] as number) > 0,
+            );
+            const budgetValue =
+                budgetField !== undefined ? ((parsed as Record<string, unknown>)[budgetField] as number) : undefined;
             const fields: Record<string, unknown> = {};
             for (const [key, span] of wpHit.fieldSpans) {
                 // "messages" keeps its WIRE POSITION (the scanner records it
@@ -147,6 +160,9 @@ export async function prepareOpenai(
                 else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
             }
             parsed = fields as OpenAIRequestBody;
+            if (budgetField !== undefined && budgetValue !== undefined) {
+                (parsed as Record<string, unknown>)[budgetField] = budgetValue;
+            }
             inboundMessageCount = wpHit.totalT;
         }
     }
