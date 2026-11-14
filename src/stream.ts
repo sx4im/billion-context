@@ -1489,16 +1489,23 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // straight back into the client-persisted history — where the
             // looping model reads them as unfinished work and slides further up
             // the same ladder (incident log: m29971–m30020 → m30021–m30070 → …
-            // across hours). Scrub the requested endpoints from the model-
+            // across hours). Mark the requested endpoints stale in the model-
             // visible receipt so that echo channel dies; the ctx.log line above
-            // keeps the real refs for the operator. Live refs are untouched:
+            // keeps the raw refs for the operator. Live refs are untouched:
             // when the note fires, every requested ref exceeds the session's
             // highest mapped ref, so no live snapshot number can collide.
+            // #6712: the marker keeps the number (`m00222(stale)`) — the old
+            // literal `[stale-ref]` token erased it, so the receipt's `range`
+            // line named nothing the caller could confirm or quote after a
+            // model switch. The `(stale)` suffix is what stops a bare phantom
+            // ref from reading as live work. Endpoints are deduplicated and
+            // longest-first so a repeated or prefix-shared endpoint is marked
+            // exactly once.
             if (beyond !== "") {
-                for (const rg of ranges) {
-                    for (const id of [rg.startRef, rg.endRef]) {
-                        receipt = receipt.split(id).join("[stale-ref]");
-                    }
+                const endpoints = [...new Set(ranges.flatMap((rg) => [rg.startRef, rg.endRef]))]
+                    .sort((a, b) => b.length - a.length);
+                for (const id of endpoints) {
+                    receipt = receipt.split(id).join(`${id}(stale)`);
                 }
             }
             return compressResult(receipt, "refused", 0, gateReason);

@@ -182,13 +182,16 @@ test("#2146: loopTracking:false (preflight lane) never touches the model-facing 
     assert.ok(!tracked.includes("CIRCUIT BREAKER"), "first tracked failure after the internal storm starts fresh");
 });
 
-test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failures keep them verbatim", () => {
+test("#6712: stale-generation receipts mark the phantom refs stale (number kept); in-frontier failures keep them verbatim", () => {
     const ctx = makeCtx(fixtureMessages());
     const stale = applyRanges(parseCompressInput(compressArgs("m00010", "m00014")), ctx).text;
     assert.ok(stale.startsWith("[Compression FAILED:"), `unknown refs fail (got: ${stale.slice(0, 120)})`);
     assert.match(stale, /above this session's highest ref \(m00008\)/, "frontier diagnosis present");
-    assert.doesNotMatch(stale, /m00010|m00014/, "phantom endpoints are NOT echoed back into the client-persisted receipt");
-    assert.match(stale, /\[stale-ref\]/, "scrubbed marker takes their place");
+    assert.match(stale, /m00010\(stale\)/, "phantom start stays quotable, marked stale (#6712)");
+    assert.match(stale, /m00014\(stale\)/, "phantom end stays quotable, marked stale (#6712)");
+    assert.doesNotMatch(stale, /m00010(?!\()/, "no bare phantom start is echoed back (#2146)");
+    assert.doesNotMatch(stale, /m00014(?!\()/, "no bare phantom end is echoed back (#2146)");
+    assert.doesNotMatch(stale, /\[stale-ref\]/, "the number-erasing token is gone (#6712)");
 
     const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
     assert.ok(mixed.startsWith("[Compressed "), "#4521 flip: an out-frontier endId clamps to the highest allocated ref instead of failing");
