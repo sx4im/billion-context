@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { resetProxyCache, validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
@@ -1524,6 +1524,68 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     const filePassthrough = loadConfigFile().passthrough === true;
     if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
+}
+
+// #6644: the providers table (opts.routes) is a snapshot built once by
+// loadOptions() at startup and refreshed only by POST /__bili/config/reload
+// (and PUT /__bili/config) — while loadRoutes() itself re-reads the file on
+// every call (#2078) and GET /__bili/config echoes the file fresh. A
+// providers.* file edit therefore stayed inert for the running helper until
+// an explicit reload, with no signal. Refresh the snapshot when the file's
+// routes actually differ, at the request-path choke point (handle()).
+// The comparison is on the parsed content (key-order-insensitive), so an
+// unchanged file never churns the proxy-agent cache, and a load failure keeps
+// serving the last-good table — a throw here would 503 every request until
+// the file is fixed — logged once per distinct error. Scope is deliberately
+// the routes surface only: compress/compat stay on their session-stamped
+// discipline (#2960 / #5930).
+function canonicalRoutesFingerprint(value: unknown): string {
+    return JSON.stringify(sortDeepForFingerprint(value));
+}
+
+function sortDeepForFingerprint(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(sortDeepForFingerprint);
+    if (value !== null && typeof value === "object") {
+        const out: Record<string, unknown> = {};
+        for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+            out[key] = sortDeepForFingerprint((value as Record<string, unknown>)[key]);
+        }
+        return out;
+    }
+    return value;
+}
+
+let lastRoutesLoadError = "";
+
+export function refreshRoutesIfStale(opts: ProxyOptions): void {
+    let fresh: ProviderRoutes;
+    let freshNamed: Record<string, NamedProviderRecipe>;
+    try {
+        fresh = loadRoutes();
+        freshNamed = loadNamedProviders();
+    } catch (err) {
+        const sig = err instanceof Error ? err.message : String(err);
+        if (sig !== lastRoutesLoadError) {
+            lastRoutesLoadError = sig;
+            loggerLog("warn", `[acp-config] providers table not reloaded: ${sig} — keeping the last-good routes (#6644)`);
+        }
+        return;
+    }
+    lastRoutesLoadError = "";
+    if (
+        canonicalRoutesFingerprint(fresh) === canonicalRoutesFingerprint(opts.routes)
+        && canonicalRoutesFingerprint(freshNamed) === canonicalRoutesFingerprint(opts.namedProviders ?? {})
+    ) return;
+    // Same in-place mutation as handleConfigReload: every handle() closure
+    // captured `opts`, so the same object reference must keep serving.
+    for (const k of Object.keys(opts.routes)) delete opts.routes[k];
+    Object.assign(opts.routes, fresh);
+    opts.namedProviders ??= {};
+    for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+    Object.assign(opts.namedProviders, freshNamed);
+    // Release cached ProxyAgents so agents for proxy URLs that were
+    // removed/changed don't leak for the process lifetime.
+    resetProxyCache();
 }
 
 // #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin

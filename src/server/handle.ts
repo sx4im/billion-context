@@ -9,7 +9,7 @@ import { defaultPrompts, type CompressionCore, type Config, type PackSurface, ty
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, refreshRoutesIfStale, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
@@ -179,6 +179,11 @@ export async function handle(
     initialWatcherPid: number | null,
     adminCtx: Parameters<typeof handleAdminRoute>[2],
 ): Promise<void> {
+    // #6644: the providers table is a startup snapshot — a providers.* file
+    // edit must reach the request path without an explicit reload. Refresh
+    // the snapshot when the file's routes actually differ; unchanged files
+    // are a no-op. Never throws (a bad edit keeps the last-good routes).
+    refreshRoutesIfStale(opts);
     const admission = new DecodedRequestAdmission();
     const decodingAbort = new AbortController();
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
