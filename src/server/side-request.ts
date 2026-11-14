@@ -101,6 +101,33 @@ export function isStructuredOutputCall(parsed: unknown): boolean {
     return typeof type === "string" && STRUCTURED_FORMAT_TYPES.has(type);
 }
 
+/** #6636: structural identification of an OpenAI audio-output (speech
+ *  synthesis) side call — a chat-completions request carrying the documented
+ *  `audio` output parameter (`{voice, format}`) asks the model to SPEAK the
+ *  reply, not to hold a conversation: the request is a one-shot utility
+ *  call (a TTS sidecar under the main session id), not an agent turn. A
+ *  real conversation turn never carries `audio`; the parameter is only
+ *  meaningful on a request whose reply is synthesized speech. It rides
+ *  the #388 verbatim side passthrough: bili's leading ACP system prompt
+ *  and tag rendering must never reach it — the speech model 400s on a
+ *  leading role:"system" message ("messages[0] system role is not
+ *  allowed for TTS model"), while the identical undecorated body
+ *  returns 200 (wire capture + control experiment, bili #6636).
+ *  The no-tools veto is part of the predicate (same discipline as
+ *  #5073): a tool-carrying audio request is a voice-mode agent turn
+ *  and stays a main turn. Both `voice` and `format` must be non-empty
+ *  strings — a stray `audio` key must not claim the lane. */
+export function isAudioOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const audio = p.audio;
+    if (audio === null || typeof audio !== "object" || Array.isArray(audio)) return false;
+    const a = audio as Record<string, unknown>;
+    return typeof a.voice === "string" && a.voice.length > 0
+        && typeof a.format === "string" && a.format.length > 0;
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
@@ -120,6 +147,11 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // pair with a 400. Routed through the #388 side passthrough like the #2500
     // server-tool shape above.
     if (isStructuredOutputCall(parsed)) return true;
+    // #6636: a request asking for synthesized-speech output is a one-shot
+    // utility call, not a conversation turn — the speech model 400s on a
+    // leading system message, so it rides the #388 verbatim side
+    // passthrough and bili injects nothing into it.
+    if (isAudioOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);

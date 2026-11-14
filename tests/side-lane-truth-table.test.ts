@@ -111,6 +111,25 @@ test("isSideRequest sanity anchors for the table above (agent wins, main never d
     assert.equal(isSideRequest({ tools: [{ name: "bili_compact" }] }, undefined), false);
 });
 
+test("isSideRequest: audio-output (TTS) shape rides the side lane (#6636)", () => {
+    // Production shape from #6636: a TTS sidecar under the main session id
+    // carries the documented `audio` output parameter and NO tools, NO
+    // output budget. It must ride the #388 verbatim side passthrough —
+    // the speech model 400s on a leading system message, so bili must
+    // inject nothing into it. Both directions pinned: the same shape
+    // with tools is a voice-mode agent turn (stays main), and dropping
+    // the audio parameter leaves an ordinary tool-less body (stays main
+    // unless some other side rule claims it).
+    const tts = { model: "mimo-v2.5-tts", audio: { format: "mp3", voice: "mimo_default" }, stream: false, messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }] };
+    assert.equal(isSideRequest(tts, undefined), true);
+    assert.equal(isSideRequest({ ...tts, tools: [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } }] }, undefined), false);
+    assert.equal(isSideRequest({ model: "mimo-v2.5-tts", stream: false, messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }] }, undefined), false);
+    assert.equal(isSideRequest({ ...tts, audio: { format: "mp3" } }, undefined), false);
+    assert.equal(isSideRequest({ ...tts, audio: { voice: "mimo_default" } }, undefined), false);
+    assert.equal(isSideRequest({ ...tts, audio: {} }, undefined), false);
+    assert.equal(isSideRequest({ ...tts, audio: "mp3" }, undefined), false);
+});
+
 test("isSideRequest: dsh auto-review shape over the Responses wire stays off the side lane (#2203)", () => {
     // Production shape from #2203: fixed REVIEW_POLICY instructions + one
     // flattened user blob, NO tools, budget either explicit-large (the client

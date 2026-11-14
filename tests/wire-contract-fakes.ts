@@ -220,6 +220,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #5998 production report (DSH self-compression rewrote session messages and the rebuilt request carried signature-less thinking blocks; an opus→sonnet mid-session switch amplifies the failure because signatures are bound to the producing model). Mechanism verified in code: kernel anthropicToCore stamps thinkingSignature only when the inbound block carries one, while coreToAnthropic re-emits EVERY reasoning core as a thinking block — unsigned cores therefore produce signature-less blocks on the wire, which Anthropic proper rejects ("thinking.signature: Field required", #2501). The two affected upstream personalities are byte-indistinguishable on the inbound wire — never-signing relays (DeepSeek /anthropic, #5495) require the unsigned blocks back verbatim — so the repair is learn-on-failure at bili\'s relay egress seam (src/server/thinking-posture.ts): first "Field required" 400 ⇒ one strip-and-resend probe; accepted ⇒ the session drops unsigned thinking proactively for the rest of its life. Constraint source: Anthropic Messages API extended-thinking contract (preserved thinking must be replayed verbatim); the kernel round-trip suite pins the positive half ("signature reattached — Anthropic rejects thinking without it").',
     },
+    {
+        id: "WC-025",
+        wire: "openai-chat",
+        summary:
+            "an audio-output (speech synthesis) chat-completions request — one carrying the `audio` output parameter — must never carry a leading role:\"system\" message: speech models reject a system role on the wire, so bili must route such requests through the verbatim side passthrough and inject nothing into them",
+        provenance:
+            "bili #6636 production 400 (dsh plugin through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts: the TTS side call to /chat/completions got bili's leading ACP system prompt plus acp tag prefixes on every message and upstream 400'd with \"messages[0] system role is not allowed for TTS model\"; the identical undecorated body returned 200 — wire capture + control experiment in the issue). Repair: src/server/side-request.ts isAudioOutputCall (#6636) routes audio-output requests through the #388 verbatim side passthrough.",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -425,7 +433,21 @@ function validateAnthropicBody(body: unknown): string[] {
 /** WC-004 on an OpenAI chat/completions body (only function-typed entries). */
 export function validateOpenAiChatBody(body: unknown): string[] {
     const out: string[] = [];
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!isPlainObject(body)) return out;
+    // WC-025 (#6636): an audio-output request must never carry a leading
+    // system message — speech models 400 on it ("messages[0] system role
+    // is not allowed for TTS model"). Runs before the tools early-return
+    // below: a TTS side call carries no tools.
+    const audio = body.audio;
+    if (isPlainObject(audio) && typeof audio.voice === "string" && audio.voice.length > 0 && typeof audio.format === "string" && audio.format.length > 0) {
+        const messages = body.messages;
+        if (Array.isArray(messages) && messages.length > 0) {
+            const first = messages[0];
+            if (isPlainObject(first) && first.role === "system")
+                out.push(`WC-025 audio-output request must not carry a leading role:"system" message — speech models reject it ("messages[0] system role is not allowed for TTS model", #6636)`);
+        }
+    }
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
         const fn = t.function;
