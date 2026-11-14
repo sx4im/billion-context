@@ -552,6 +552,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
             // happens: every retry re-failed the same way and the advertised
             // merge dead-ended (billion-context#5919, session-ad47cd30).
             // Such a merge is now an idempotent no-op with exact guidance.
+            // #6709: that no-op used to fire BEFORE the exclusion ladder
+            // below, so one BLOCKED stranded partner vetoed the WHOLE merge
+            // even when excluding its owning block would let the merge
+            // complete around it (the reported b312..b315 dead-end:
+            // thousands of BLOCKED refs poisoned every batch while the clean
+            // blocks in the range could still distill). The no-op now runs
+            // AFTER rung 1 — only when the ladder cannot complete the merge.
             const refOf5919 = (id: string): string =>
               input.state.messageRefs.byRaw[id] ?? id;
             const isNeverFoldable5919 = (id: string): boolean => {
@@ -574,19 +581,6 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
               (id) => !survivingCoverage.has(id) && !consumedCoverage.has(id),
             );
             const doomedStranded = visibleStranded.filter(isNeverFoldable5919);
-            if (doomedStranded.length > 0) {
-              const foldablePartners = visibleStranded.filter(
-                (id) => !isNeverFoldable5919(id),
-              );
-              warnings.push(
-                `Merge of ${consumedBlockIds.join(", ")} skipped — its turn cannot be closed now: ${doomedStranded.map(refOf5919).join(", ")} ${doomedStranded.length === 1 ? "is" : "are"} protected (never foldable) while the rest of their turn is covered by block(s). Do not retry this merge.${foldablePartners.length > 0 ? ` The foldable partner(s) ${foldablePartners.map(refOf5919).join(", ")} can only close their turn together with the protected member(s) — they stay visible until the protection lifts.` : ""}`,
-              );
-              // Consume nothing so the no-op below leaves every block active
-              // (coverage intact — the #4484 invariant).
-              consumedBlockIds = [];
-              filteredIds = [];
-              return finish({ fatal: null });
-            }
             // #5919 rung 2 (fallback): rung 1 (the exclusion ladder) could
             // not complete the merge — it re-failed, or it "succeeded" by
             // folding nothing while the conflict stays live (the silent
@@ -688,17 +682,30 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
                   return retried;
                 }
                 // Rung 1 could not complete the merge (re-failed, or folded
-                // nothing while the conflict stays live) — rung 2.
-                tryExtend5919();
-              } else {
-                // No consumed block owns the unresolved ids: nothing to
-                // exclude — rung 2 directly.
-                tryExtend5919();
+                // nothing while the conflict stays live) — the doomed check
+                // below decides between the no-op and rung 2.
               }
-            } else {
-              // Ladder exhausted (64 exclusions) — rung 2.
-              tryExtend5919();
+              // No consumed block owns the unresolved ids, or rung 1 failed:
+              // do NOT extend yet — the doomed check below runs first.
             }
+            // #6709: the doomed no-op (moved below rung 1). When a stranded
+            // partner can NEVER fold, the merge is an idempotent no-op with
+            // exact guidance — but only once the ladder has had its chance.
+            if (doomedStranded.length > 0) {
+              const foldablePartners = visibleStranded.filter(
+                (id) => !isNeverFoldable5919(id),
+              );
+              warnings.push(
+                `Merge of ${consumedBlockIds.join(", ")} skipped — its turn cannot be closed now: ${doomedStranded.map(refOf5919).join(", ")} ${doomedStranded.length === 1 ? "is" : "are"} protected (never foldable) while the rest of their turn is covered by block(s). Do not retry this merge.${foldablePartners.length > 0 ? ` The foldable partner(s) ${foldablePartners.map(refOf5919).join(", ")} can only close their turn together with the protected member(s) — they stay visible until the protection lifts.` : ""}`,
+              );
+              // Consume nothing so the no-op below leaves every block active
+              // (coverage intact — the #4484 invariant).
+              consumedBlockIds = [];
+              filteredIds = [];
+              return finish({ fatal: null });
+            }
+            // Rung 2 (only reached when no stranded partner is never-foldable).
+            tryExtend5919();
             if (!extended5919) {
               if (retried !== null && retried.fatal === null) {
                 // Rung 1 "succeeded" by folding nothing and rung 2 had no
