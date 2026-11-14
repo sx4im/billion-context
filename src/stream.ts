@@ -1067,8 +1067,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // arm, which refused every multi-round cleanup continuation.
     const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
     if (gate?.requireNudge && !gate.armed) {
+        const specKey = parsed.ranges.length > 0 ? normalizedSpecKey(parsed.ranges) : "unprompted";
+        const guard = recordCompressFailure(ctx.session, specKey);
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+        const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
         ctx.log("[acp-proxy: refused unprompted compress — no live nudge credit (window expired or never minted) (compress.requireNudge)]");
-        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.]`, "refused", 0, "unprompted");
+        if (trackLoop && occurrences >= 2) {
+            ctx.log(`[acp-proxy: refused-receipt collapsed to one-liner (attempt ${occurrences}, gate=unprompted)]`);
+            return compressResult(`[Compression REFUSED again — this exact call has now been refused ${occurrences} time(s) the same way; nothing was compressed. The reason and eligible ranges are in the FIRST refusal receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, "unprompted");
+        }
+        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.${guard}${loopGuard}]`, "refused", 0, "unprompted");
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -1219,8 +1227,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const offending = outOfRecommendedRanges(ranges, ctx);
         if (offending.length > 0) {
             const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
+            const specKey = normalizedSpecKey(ranges);
+            const guard = recordCompressFailure(ctx.session, specKey);
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+            const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
-            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.]`, "refused", 0, "out-of-recommendation");
+            if (trackLoop && occurrences >= 2) {
+                ctx.log(`[acp-proxy: refused-receipt collapsed to one-liner (attempt ${occurrences}, gate=out-of-recommendation)]`);
+                return compressResult(`[Compression REFUSED again — this exact call has now been refused ${occurrences} time(s) the same way; nothing was compressed. The reason and eligible ranges are in the FIRST refusal receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, "out-of-recommendation");
+            }
+            if (recommendedIntervals(ctx).length === 0) {
+                return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. ${NO_RANGES_REMAIN_TEXT}${guard}${loopGuard}]`, "refused", 0, "out-of-recommendation");
+            }
+            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.${guard}${loopGuard}]`, "refused", 0, "out-of-recommendation");
         }
     }
     if (ctx.messages.length > 0) {
