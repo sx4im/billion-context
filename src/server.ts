@@ -2015,6 +2015,11 @@ export type Prepared = {
      *  must re-stamp its own breakpoint on the trigger turn or the post-fold
      *  prefix is never written to the prefix cache. */
     anthropicClientCacheControls?: Map<string, unknown>;
+    /** #6632: set by prepareAnthropic when the outbound request carries
+     *  `thinking.block_binding` (drop_block) for a thinking-binding model —
+     *  the relay appends the matching `anthropic-beta` value to the shared
+     *  outbound headers (initial send + every re-send derives from it). */
+    anthropicThinkingBinding?: boolean;
     /** Original leading system/developer prefix text captured by the kernel's
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */

@@ -71,7 +71,7 @@ import { recordPckAblation } from "../pck-probe.js";
 import { detectThinkingSignatureRejection, rememberStrictThinkingPosture, stripUnsignedThinkingFromWire, thinkingPostureIsStrict } from "./thinking-posture.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
-import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
+import { buildForwardHeaders, addThinkingBindingBeta, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
@@ -434,6 +434,12 @@ async function forwardCaptured(
             log("debug", `[${prepared?.session.id ?? "passthrough"}] [lane-credential] applied ${laneCred.reference} for ${maskUrlForLog(upstreamUrl)} (#2336)`);
         }
     }
+    // #6632: the prepared body carries thinking.block_binding for a
+    // thinking-binding model — the matching anthropic-beta value rides the
+    // shared `headers` record, so the initial send AND every re-send (role
+    // ladder, overflow refold, compress-loop rounds) derive it via
+    // buildForwardHeaders. Both compression modes share this seam.
+    if (prepared?.anthropicThinkingBinding === true) addThinkingBindingBeta(headers);
     const applyResign = (hdrs: Record<string, string>, bodyStr: string | Buffer): void => {
         if (resignCtx === undefined || req.method === "GET" || req.method === "HEAD") return;
         try {

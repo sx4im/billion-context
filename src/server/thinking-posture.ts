@@ -135,3 +135,60 @@ function asContentBlocks(content: unknown): unknown[] {
     if (typeof content === "string") return [{ type: "text", text: content }];
     return [];
 }
+
+// ---------------------------------------------------------------------------
+// #6632: thinking-block binding on Fable-class upstreams.
+// ---------------------------------------------------------------------------
+//
+// Fable-class upstreams (claude-fable-5-2) bind each signed thinking block to
+// the exact history prefix it was created on. Any fold that rewrites that
+// prefix — snapshot render, legacy processTurn, a client-side compaction, or
+// a compress executed mid-request — makes the NEXT request fail with 400
+// "Invalid `signature` in `thinking` block", and the invalid block stays in
+// the client history, so the session bricks permanently. Opus 5.5 does NOT
+// enforce the binding (evidence: #6632 — same fold, Opus unaffected).
+//
+// The remedy is the one the 400 itself names: opt into Anthropic's handling
+// by adding `thinking-binding-controls-2026-08-01` to `anthropic-beta` and
+// setting `thinking.block_binding.prefix_mismatch_behavior` to `drop_block`,
+// so the upstream drops the mismatched block instead of rejecting the whole
+// request. This is proactive, not learn-on-failure: the opt-in is inert
+// upstream whenever no prefix mismatch exists (nothing is dropped), so it is
+// applied on every extended-thinking request for a binding model — including
+// pre-fold turns, so a fold created mid-request rides into the round-2
+// re-request through the prepared body. It never touches the thinking bytes
+// themselves (KDD #10): the block is dropped server-side by Anthropic, and
+// the client's persisted history is left verbatim.
+//
+// Scope is deliberately narrow (KDD #9 evidence-permitlist discipline): only
+// models observed to enforce the binding join the family — a new model joins
+// only with traffic evidence, never by analogy.
+
+/** The Anthropic beta that enables thinking-binding controls. */
+export const THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01";
+
+/** True for model ids in the thinking-binding family (the `fable` segment). */
+export function isThinkingBindingModel(model: string | undefined): boolean {
+    if (typeof model !== "string" || model.length === 0) return false;
+    const bare = model.replace(/\[[^\]]*\]$/, "");
+    return bare.toLowerCase().split("-").some((segment) => segment === "fable");
+}
+
+/**
+ * Set `thinking.block_binding.prefix_mismatch_behavior` to `drop_block` on an
+ * outbound Anthropic body, when the request is for a binding model with
+ * extended thinking on. Returns true when it set the field. A client-set
+ * block_binding is never clobbered; a missing or explicitly-disabled
+ * `thinking` param is left alone (block_binding without a thinking type
+ * would invent a config the client never asked for).
+ */
+export function applyThinkingBinding(body: Record<string, unknown>, model: string | undefined): boolean {
+    if (!isThinkingBindingModel(model)) return false;
+    const thinking = body.thinking;
+    if (typeof thinking !== "object" || thinking === null || Array.isArray(thinking)) return false;
+    const t = thinking as Record<string, unknown>;
+    if (t.type === "disabled") return false;
+    if (t.block_binding !== undefined) return false;
+    t.block_binding = { prefix_mismatch_behavior: "drop_block" };
+    return true;
+}

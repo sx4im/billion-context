@@ -166,6 +166,33 @@ test("WC-024 thinking blocks must carry a signature (#5998)", () => {
     })[0], /WC-024/);
 });
 
+test("WC-025 thinking-binding model with extended thinking must opt into drop_block (#6632)", () => {
+    const fableThinking = {
+        model: "claude-fable-5-2",
+        thinking: { type: "enabled", budget_tokens: 1024 },
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig_A" }, { type: "text", text: "a" }] },
+        ],
+    };
+    // Legal: the opt-in is present.
+    assert.deepEqual(VALIDATORS.anthropic({
+        ...fableThinking,
+        thinking: { type: "enabled", budget_tokens: 1024, block_binding: { prefix_mismatch_behavior: "drop_block" } },
+    }), []);
+    // Illegal: the opt-in is missing — one fold away from a bricked session.
+    assert.match(VALIDATORS.anthropic(fableThinking)[0], /WC-025/);
+    // Illegal: a different block_binding value is not the opt-in.
+    assert.match(VALIDATORS.anthropic({
+        ...fableThinking,
+        thinking: { type: "enabled", budget_tokens: 1024, block_binding: { prefix_mismatch_behavior: "keep_block" } },
+    })[0], /WC-025/);
+    // Legal: Opus does not enforce the binding, so no opt-in is required.
+    assert.deepEqual(VALIDATORS.anthropic({ ...fableThinking, model: "claude-opus-5-5" }), []);
+    // Legal: no extended thinking on the request — nothing to bind.
+    assert.deepEqual(VALIDATORS.anthropic({ ...fableThinking, thinking: undefined }), []);
+    assert.deepEqual(VALIDATORS.anthropic({ ...fableThinking, thinking: { type: "disabled" } }), []);
+});
+
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
     // #2648 shape: unmarked tools render ahead of a global system block.
     assert.match(VALIDATORS.anthropic({
@@ -269,6 +296,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             ] },
             // WC-024: the DSH transcript shape (#5998) — assistant thinking without a signature.
             { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t" }] }] },
+            // WC-025: a Fable request with extended thinking on but no drop_block opt-in (#6632).
+            { model: "claude-fable-5-2", thinking: { type: "enabled", budget_tokens: 1024 }, messages: [] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },

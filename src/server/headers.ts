@@ -1,3 +1,5 @@
+import { THINKING_BINDING_BETA } from "./thinking-posture.js";
+
 /** Session ids are client-provided verbatim (#286) — sanitize before using
  *  one in a debug-dump FILENAME so a hostile value cannot escape the dir. */
 export function safeSessionId(id: string | undefined): string {
@@ -108,4 +110,20 @@ export function buildForwardHeaders(headers: Record<string, string>): Record<str
     }
     out["content-type"] = "application/json";
     return out;
+}
+
+/** #6632: append the thinking-binding-controls beta to the outbound
+ *  `anthropic-beta` header (the companion half of
+ *  `thinking.block_binding` — without it the upstream ignores the param).
+ *  Appends to the client's own key when one exists (case-insensitive, so no
+ *  second key is minted); a repeat call is a no-op. */
+export function addThinkingBindingBeta(headers: Record<string, string>): void {
+    const key = Object.keys(headers).find((h) => h.toLowerCase() === "anthropic-beta") ?? "anthropic-beta";
+    const existing = headers[key];
+    if (existing === undefined || existing.length === 0) {
+        headers[key] = THINKING_BINDING_BETA;
+        return;
+    }
+    const values = existing.split(",").map((s) => s.trim());
+    if (!values.includes(THINKING_BINDING_BETA)) headers[key] = `${existing}, ${THINKING_BINDING_BETA}`;
 }

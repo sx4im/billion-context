@@ -34,6 +34,7 @@ import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
+import { applyThinkingBinding } from "./thinking-posture.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
@@ -652,6 +653,13 @@ export async function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+    // #6632: on a thinking-binding model (Fable) with extended thinking on,
+    // opt into drop_block so a fold-rewritten prefix cannot brick the session
+    // on the next request. Applies in BOTH compression modes: proxy mode and
+    // plugin mode share this prepare path (the plugin's own compress still
+    // flows through here), and the flag rides the prepared body into the
+    // compress-loop round-2 rebuild as well.
+    const thinkingBinding = applyThinkingBinding(rebuilt, resolvedModel ?? parsed.model);
     // #728: record the char-count upper bound of THIS turn's outbound payload
     // (post-fold messages + system/tools overhead + images) as the fallback
     // token source for upstreams that never report usage — read only while
@@ -678,7 +686,7 @@ export async function prepareAnthropic(
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, anthropicThinkingBinding: thinkingBinding || undefined, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";

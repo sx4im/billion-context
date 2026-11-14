@@ -16,6 +16,8 @@
 import http from "node:http";
 import { once } from "node:events";
 
+import { isThinkingBindingModel, THINKING_BINDING_BETA } from "../src/server/thinking-posture.ts";
+
 export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
 
 interface WireRule {
@@ -220,6 +222,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #5998 production report (DSH self-compression rewrote session messages and the rebuilt request carried signature-less thinking blocks; an opus→sonnet mid-session switch amplifies the failure because signatures are bound to the producing model). Mechanism verified in code: kernel anthropicToCore stamps thinkingSignature only when the inbound block carries one, while coreToAnthropic re-emits EVERY reasoning core as a thinking block — unsigned cores therefore produce signature-less blocks on the wire, which Anthropic proper rejects ("thinking.signature: Field required", #2501). The two affected upstream personalities are byte-indistinguishable on the inbound wire — never-signing relays (DeepSeek /anthropic, #5495) require the unsigned blocks back verbatim — so the repair is learn-on-failure at bili\'s relay egress seam (src/server/thinking-posture.ts): first "Field required" 400 ⇒ one strip-and-resend probe; accepted ⇒ the session drops unsigned thinking proactively for the rest of its life. Constraint source: Anthropic Messages API extended-thinking contract (preserved thinking must be replayed verbatim); the kernel round-trip suite pins the positive half ("signature reattached — Anthropic rejects thinking without it").',
     },
+    {
+        id: "WC-025",
+        wire: "anthropic",
+        summary:
+            'on a thinking-binding model (the Fable family — claude-fable-5-2 observed), an extended-thinking request must carry `thinking.block_binding.prefix_mismatch_behavior` set to `drop_block` AND `thinking-binding-controls-2026-08-01` in the `anthropic-beta` header: Fable binds each signed thinking block to the exact history prefix it was created on, so any fold that rewrites that prefix makes the next request 400 with "Invalid `signature` in `thinking` block" and bricks the session permanently; the opt-in is inert upstream when no prefix mismatch exists, so it rides every extended-thinking request for a binding model, not only post-fold turns',
+        provenance:
+            'bili #6632 production report (DSH native plugin lane, claude-fable-5-2, billion-context 0.1.213 = current master: every fold that rewrote the history prefix made the next request fail with 400 "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \\"drop_block\\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header."; Opus 5.5 is NOT affected — it does not enforce the binding. Repair: prepareAnthropic sets block_binding=drop_block on every extended-thinking request for a binding model (src/server/thinking-posture.ts applyThinkingBinding; the client-set value is never clobbered) and the relay appends the matching beta to the shared outbound headers (src/server/headers.ts addThinkingBindingBeta). The thinking bytes themselves are never rewritten (KDD #10) — the mismatched block is dropped server-side by Anthropic. Scope is the Fable family only, per the KDD #9 evidence-permitlist discipline: a new model joins only with traffic evidence.',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -346,10 +356,51 @@ function unsignedThinkingViolations(messages: unknown[]): string[] {
     return out;
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023, WC-024 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-025: on a thinking-binding model (Fable family) with extended thinking
+ *  on, the request must carry `thinking.block_binding.prefix_mismatch_behavior`
+ *  set to `drop_block` — any fold that rewrote the prefix before a signed
+ *  thinking block was created makes the next request 400 otherwise (#6632).
+ *  The gate mirrors the fix exactly (model + thinking enabled); the header
+ *  half is enforced by thinkingBindingHeaderViolations below, where the
+ *  request headers live. Shared by both Anthropic lanes in shape, but the
+ *  Vertex lane never carries a body `model`, so it cannot fire there. */
+function needsThinkingBinding(body: Record<string, unknown>): boolean {
+    const model = typeof body.model === "string" ? body.model : undefined;
+    if (!isThinkingBindingModel(model)) return false;
+    const thinking = body.thinking;
+    if (typeof thinking !== "object" || thinking === null || Array.isArray(thinking)) return false;
+    if ((thinking as Record<string, unknown>).type === "disabled") return false;
+    return true;
+}
+
+function thinkingBindingViolations(body: Record<string, unknown>): string[] {
+    if (!needsThinkingBinding(body)) return [];
+    const thinking = body.thinking as Record<string, unknown>;
+    const binding = thinking.block_binding;
+    const behavior = typeof binding === "object" && binding !== null && !Array.isArray(binding)
+        ? (binding as Record<string, unknown>).prefix_mismatch_behavior
+        : undefined;
+    if (behavior === "drop_block") return [];
+    return ["WC-025 thinking-binding model with extended thinking on must carry thinking.block_binding.prefix_mismatch_behavior set to \"drop_block\" (#6632)"];
+}
+
+/** WC-025 header half: the drop_block param is ignored upstream without its
+ *  beta, so the `anthropic-beta` header must include
+ *  `thinking-binding-controls-2026-08-01` on the same requests. */
+export function thinkingBindingHeaderViolations(headers: Record<string, string | string[] | undefined>, body: unknown): string[] {
+    if (!isPlainObject(body)) return [];
+    if (!needsThinkingBinding(body)) return [];
+    const beta = headers["anthropic-beta"];
+    const text = Array.isArray(beta) ? beta.join(",") : String(beta ?? "");
+    if (text.split(",").map((s) => s.trim()).includes(THINKING_BINDING_BETA)) return [];
+    return ["WC-025 thinking-binding model with extended thinking on must carry thinking-binding-controls-2026-08-01 in the anthropic-beta header (#6632)"];
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023, WC-024, WC-025 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    out.push(...thinkingBindingViolations(body));
     if (Array.isArray(body.messages))
         body.messages.forEach((m, i) => {
             if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) return;
@@ -877,6 +928,9 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string;
             } catch { /* non-JSON body: nothing to validate */ }
             const gmodel = wire === "google" ? (req.url ?? "").match(/\/models\/([^/:]+):/)?.[1] : undefined;
             const found = gmodel !== undefined ? validateGoogleBody(parsed, gmodel) : validate(parsed);
+            // WC-025 header half: the body validator cannot see headers, so the
+            // fake enforces the beta here, where the request headers live.
+            if (wire === "anthropic") found.push(...thinkingBindingHeaderViolations(req.headers, parsed));
             const pathInfo = lane === "vertex-anthropic" ? vertexAnthropicPathInfo(req.url ?? "") : null;
             const streaming = pathInfo?.method === "streamRawPredict";
             requests.push({ url: req.url ?? "", body: parsed, ...(lane === "vertex-anthropic" ? { model: pathInfo?.model ?? null } : {}) });
