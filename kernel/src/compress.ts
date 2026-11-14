@@ -728,16 +728,31 @@ export function createCore(ports: Ports = {}): CompressionCore {
         foldCandidates.push(spec);
       }
       const lengthFailures: string[] = [];
+      // #6730: the batch rejection's remediation must match the failure
+      // DIRECTION. validateSummaryLength fails min-side ("too short" /
+      // empty) and max-side ("too long"); the old fixed text always said
+      // "shorten or split ... to fit its cap", which told a too-short
+      // summary to get shorter and spun a retry loop. Count each side so
+      // the remediation below points the right way. Empty counts as short
+      // — it needs a summary written, not a shorter one.
+      let shortFailures = 0;
+      let longFailures = 0;
+      const failureIsShort = (message: string): boolean =>
+        message.startsWith("Summary too short") ||
+        message.startsWith("Summary is empty");
       const minLen = input.config.compress.minSummaryLength;
       if (foldCandidates.length === 1) {
         const solo = foldCandidates[0]!;
         try {
           validateSummaryLength(solo, input.config.compress);
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (failureIsShort(message)) shortFailures++;
+          else longFailures++;
           lengthFailures.push(
             rangeError(
               solo,
-              error instanceof Error ? error.message : String(error),
+              message,
             ),
           );
         }
@@ -746,10 +761,13 @@ export function createCore(ports: Ports = {}): CompressionCore {
           try {
             validateSummaryLength(spec, input.config.compress, { skipMin: true });
           } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (failureIsShort(message)) shortFailures++;
+            else longFailures++;
             lengthFailures.push(
               rangeError(
                 spec,
-                error instanceof Error ? error.message : String(error),
+                message,
               ),
             );
           }
@@ -760,6 +778,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             0,
           );
           if (total < minLen) {
+            shortFailures++;
             lengthFailures.push(
               `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
             );
@@ -771,13 +790,22 @@ export function createCore(ports: Ports = {}): CompressionCore {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
         // so returning it is safe (same contract as the minCompressRange gate).
+        // #6730: the remediation matches the failure direction — a too-short
+        // summary is told to LENGTHEN (never "shorten" or "cap", which belong
+        // to the too-long side only); a mixed batch gets both directions.
+        const remediation =
+          shortFailures > 0 && longFailures === 0
+            ? "lengthen each offending range's summary to at least the minimum, then resend the whole batch"
+            : longFailures > 0 && shortFailures === 0
+              ? "shorten or split each offending range's summary to fit its cap, then resend the whole batch"
+              : "lengthen each too-short summary to at least the minimum and shorten or split each too-long summary to fit its cap, then resend the whole batch";
         return {
           state,
           result: {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: ${remediation}; or drop the offending range(s) and resend only the rest that validate.`,
               ...classificationErrors,
             ],
             warnings: [],
