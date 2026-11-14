@@ -771,13 +771,28 @@ export function createCore(ports: Ports = {}): CompressionCore {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
         // so returning it is safe (same contract as the minCompressRange gate).
+        // #6730: the remediation must match the validation direction. The old
+        // text always said "shorten or split ... to fit its cap", even when
+        // every failure was a too-short summary — following it only made the
+        // summary shorter and spun a retry loop into the circuit breaker.
+        // Aim the advice at the side that actually failed.
+        const hasShort = lengthFailures.some(
+          (f) => f.includes("too short") || f.includes("Summary is empty"),
+        );
+        const hasLong = lengthFailures.some((f) => f.includes("too long"));
+        const remedy =
+          hasShort && hasLong
+            ? "lengthen each too-short summary to at least the minimum and shorten or split each too-long summary to fit its cap, then resend the whole batch"
+            : hasShort
+              ? "lengthen each offending range's summary to at least the minimum, then resend the whole batch"
+              : "shorten or split each offending range's summary to fit its cap, then resend the whole batch";
         return {
           state,
           result: {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: ${remedy}; or drop the offending range(s) and resend only the rest that validate.`,
               ...classificationErrors,
             ],
             warnings: [],
