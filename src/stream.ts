@@ -1489,15 +1489,26 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // straight back into the client-persisted history — where the
             // looping model reads them as unfinished work and slides further up
             // the same ladder (incident log: m29971–m30020 → m30021–m30070 → …
-            // across hours). Scrub the requested endpoints from the model-
-            // visible receipt so that echo channel dies; the ctx.log line above
-            // keeps the real refs for the operator. Live refs are untouched:
-            // when the note fires, every requested ref exceeds the session's
-            // highest mapped ref, so no live snapshot number can collide.
+            // across hours). #6712: masking them outright as "[stale-ref]"
+            // destroyed the receipt's diagnostic value at exactly the moment
+            // the caller needs it — it can no longer tell WHICH ref it used,
+            // so it cannot self-correct or quote the ref in a bug report.
+            // Mark each endpoint `<ref>(stale)` instead: the number stays
+            // visible for diagnosis, while the token is not a bare ref the
+            // model can copy-paste as a live target, so the #2146 echo
+            // channel stays closed. The ctx.log line above keeps the real
+            // refs for the operator. Live refs are untouched: when the note
+            // fires, every requested ref exceeds the session's highest mapped
+            // ref, so no live snapshot number can collide. Each id is
+            // replaced once — the marker text contains the id, so a second
+            // pass over the same id (single-message range) would double-mark.
             if (beyond !== "") {
+                const marked = new Set<string>();
                 for (const rg of ranges) {
                     for (const id of [rg.startRef, rg.endRef]) {
-                        receipt = receipt.split(id).join("[stale-ref]");
+                        if (marked.has(id)) continue;
+                        marked.add(id);
+                        receipt = receipt.split(id).join(`${id}(stale)`);
                     }
                 }
             }
