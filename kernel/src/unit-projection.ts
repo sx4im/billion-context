@@ -587,6 +587,49 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
               filteredIds = [];
               return finish({ fatal: null });
             }
+            // #6709: a merge whose turn-integrity conflict is caused ONLY by
+            // BLOCKED partners must proceed, not dead-end. The doomed check
+            // above only sees VISIBLE stranded partners: a BLOCKED member
+            // covered by the consumed block is invisible to it, so the
+            // exclusion ladder re-fails and the extend rung refuses — and a
+            // BLOCKED message never ages into coverage, so the fatal is
+            // permanent and the old block can never distill
+            // (billion-context#6709, session-ad47cd30). Proceed only when
+            // EVERY relevant unresolved id belongs to a turn group holding a
+            // BLOCKED member: the conflict is BLOCKED-caused, the foldable
+            // partners fold, the BLOCKED members keep their current coverage
+            // (transferred to the new block), and the turn's visible
+            // partner(s) stay visible — no new uncloseable state is exposed.
+            // A visible stranded BLOCKED partner still no-ops above (doomed
+            // non-empty), so this rung never fires for it.
+            const groups6709 = (shared?.integrityPre ??
+              buildIntegrityPre(input.messages)).groups;
+            const groupOf6709 = new Map<string, string[]>();
+            for (const group of groups6709)
+              for (const id of group) groupOf6709.set(id, group);
+            const isBlocked6709 = (id: string): boolean => {
+              if (refOf5919(id) === "BLOCKED") return true;
+              return msgById(id) === undefined;
+            };
+            const proceed6709 =
+              relevantUnresolved.length > 0 &&
+              relevantUnresolved.every((id) => {
+                const group = groupOf6709.get(id);
+                return group !== undefined && group.some(isBlocked6709);
+              });
+            if (proceed6709) {
+              const blockedCount6709 = new Set(
+                relevantUnresolved.flatMap(
+                  (id) => groupOf6709.get(id) ?? [],
+                ).filter(isBlocked6709),
+              ).size;
+              warnings.push(
+                `Merge of ${consumedBlockIds.join(", ")} proceeded although its turn cannot close: ${blockedCount6709} BLOCKED partner(s) (body already removed upstream) can never fold, so the turn stays formally split — the BLOCKED partner(s) keep their current coverage and the remaining members folded into the new block (billion-context#6709). Fold the stranded visible partner(s) separately with a plain message-range compress to close the rest of the turn.`,
+              );
+              // Skip the exclusion ladder below (it can only re-fail here)
+              // and fall through to the common withdrawal handling, the
+              // same path merge-neutral inheritance takes.
+            }
             // #5919 rung 2 (fallback): rung 1 (the exclusion ladder) could
             // not complete the merge — it re-failed, or it "succeeded" by
             // folding nothing while the conflict stays live (the silent
@@ -653,7 +696,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
               return true;
             };
             let retried: UnitProjection | null = null;
-            if ((input.excludeNestedBlockIds?.size ?? 0) < 64) {
+            if (!proceed6709 && (input.excludeNestedBlockIds?.size ?? 0) < 64) {
               const ownerByMessageId = new Map<string, string>();
               for (const bid of consumedBlockIds) {
                 const block = blockById(input.state, bid);
@@ -699,7 +742,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
               // Ladder exhausted (64 exclusions) — rung 2.
               tryExtend5919();
             }
-            if (!extended5919) {
+            if (!extended5919 && !proceed6709) {
               if (retried !== null && retried.fatal === null) {
                 // Rung 1 "succeeded" by folding nothing and rung 2 had no
                 // foldable partner to extend to (the #5789 self-range no-op
