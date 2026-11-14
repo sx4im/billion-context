@@ -767,6 +767,24 @@ export function createCore(ports: Ports = {}): CompressionCore {
         }
       }
       batchFloorByTotal = foldCandidates.length > 1;
+      // #6730: the remediation must match the failure direction. The generic
+      // "shorten or split ... to fit its cap" is correct only for over-cap
+      // summaries; for under-floor summaries it tells the caller to do exactly
+      // what keeps failing (shorten a too-short summary), spinning a retry
+      // loop until the circuit breaker fires.
+      const tooShortCount = lengthFailures.filter(
+        (failure) =>
+          failure.includes("too short") || failure.includes("is empty"),
+      ).length;
+      const tooLongCount = lengthFailures.filter((failure) =>
+        failure.includes("too long"),
+      ).length;
+      const lengthRemediation =
+        tooShortCount > 0 && tooLongCount === 0
+          ? "lengthen each offending range's summary to reach its minimum"
+          : tooLongCount > 0 && tooShortCount === 0
+            ? "shorten or split each offending range's summary to fit its cap"
+            : "lengthen summaries that are too short to reach their minimum and shorten or split summaries that are too long to fit their cap";
       if (lengthFailures.length > 0) {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
@@ -777,7 +795,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
             blocksCreated: 0,
             tokensCompressed: 0,
             errors: [
-              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: ${lengthRemediation}, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
               ...classificationErrors,
             ],
             warnings: [],
