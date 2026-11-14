@@ -274,6 +274,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
             { tools: [{ type: "function", function: { name: "x".repeat(65), parameters: { type: "object", properties: {} } } }] },
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
+            // WC-025: the #6636 shape — an audio-output request with a leading system message.
+            { model: "mimo-v2.5-tts", audio: { format: "mp3", voice: "mimo_default" }, messages: [{ role: "system", content: "s" }, { role: "user", content: "u" }] },
         ],
         responses: [
             { type: "response.create", input: [], stream: true },

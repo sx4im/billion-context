@@ -5,12 +5,12 @@ import { once } from "node:events";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, defaultPrompts, FUNCTION_ACP_TAGS_TIMESTAMPED } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, detectSystemRoleRejection, hasOffHeadSystem, parseCompatRoles, resolveCompatRoles, stripBiliAcpDecoration } from "../src/compat-roles.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -625,4 +625,110 @@ test("hasOffHeadSystem: responses wire shapes (#1996 offender = type-less mid-hi
     );
     assert.equal(hasOffHeadSystem(p([{ role: "developer", content: "d" }, { role: "user", content: "u" }]), "responses"), false, "off-head developer stays clean");
     assert.equal(hasOffHeadSystem("{not json", "responses"), false, "unparseable body → no claim");
+});
+
+test("detectSystemRoleRejection: system role forbidden outright (#6636)", () => {
+    // Production string from #6636 (Xiaomi MiMo TTS).
+    const xiaomi = JSON.stringify({ error: { code: "400", message: "Param Incorrect", param: "messages[0] system role is not allowed for TTS model", type: "" } });
+    assert.equal(detectSystemRoleRejection(400, xiaomi), true, "the exact production 400");
+    assert.equal(detectSystemRoleRejection(422, xiaomi), true, "same rejection on 422");
+    assert.equal(detectSystemRoleRejection(400, "system role is not supported for this model"), true);
+    assert.equal(detectSystemRoleRejection(400, "messages[0] system role is not allowed"), true);
+    assert.equal(detectSystemRoleRejection(400, "system role forbidden on this endpoint"), true);
+    // The WC-025 fake violation string quotes the production message.
+    assert.equal(
+        detectSystemRoleRejection(400, 'wire-contract violation(s): WC-025 audio-output request must not carry a leading role:"system" message — speech models reject it ("messages[0] system role is not allowed for TTS model", #6636)'),
+        true, "the wire-contract fake's rendering of the same rejection",
+    );
+    // Negative direction: the other two detectors own these shapes.
+    assert.equal(detectSystemRoleRejection(400, "System message must be at the beginning."), false, "placement error — the #552 ladder owns it");
+    assert.equal(detectSystemRoleRejection(400, "Invalid role: developer"), false, "role rejection — the #552 ladder owns it");
+    assert.equal(detectSystemRoleRejection(400, "messages[0].role: unknown variant `developer`"), false, "serde role rejection — the ladder owns it");
+    assert.equal(detectSystemRoleRejection(400, "insufficient quota"), false, "unrelated 400");
+    assert.equal(detectSystemRoleRejection(400, "messages[3] system role is not allowed for TTS model"), false, "a later index is a mid-history client system, not bili's head");
+    assert.equal(detectSystemRoleRejection(200, xiaomi), false, "status gate");
+    assert.equal(detectSystemRoleRejection(500, xiaomi), false, "status gate");
+});
+
+test("stripBiliAcpDecoration: tags-only lane drops the ACP system and the tag prefixes (#6636)", () => {
+    // Tag bytes use hex escapes per KDD #2.
+    const tag = (ref: string, tokens: string, type: string, time?: string) =>
+        `\x3cacp tokens="${tokens}" type="${type}"${time === undefined ? "" : ` time="${time}"`}\x3e${ref}\x3c/acp\x3e\n`;
+    const decorated = JSON.stringify({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "system", content: FUNCTION_ACP_TAGS_TIMESTAMPED },
+            { role: "user", content: `${tag("m04649", "16", "text", "2026-11-13 20:33:30")}请用自然口语的方式朗读下面这句话` },
+            { role: "assistant", content: `${tag("m05235", "22", "text")}这条要念的话。` },
+        ],
+        audio: { format: "mp3", voice: "mimo_default" },
+        stream: false,
+    });
+    const out = stripBiliAcpDecoration(decorated);
+    assert.ok(out, "provably bili-decorated → stripped");
+    assert.equal(out.strippedSystem, true);
+    assert.equal(out.strippedTags, 2);
+    const body = JSON.parse(out.body) as Record<string, unknown>;
+    assert.equal(body.model, "mimo-v2.5-tts", "scalar fields pass through untouched");
+    assert.deepEqual(body.audio, { format: "mp3", voice: "mimo_default" });
+    assert.equal(body.stream, false);
+    const messages = body.messages as Array<{ role: string; content: string }>;
+    assert.equal(messages.length, 2, "the injected system is gone");
+    assert.deepEqual(messages[0], { role: "user", content: "请用自然口语的方式朗读下面这句话" });
+    assert.deepEqual(messages[1], { role: "assistant", content: "这条要念的话。" });
+});
+
+test("stripBiliAcpDecoration: full-prompt lane drops the whole system when the client sent none (#6636)", () => {
+    const tag = `\x3cacp tokens="8" type="text"\x3em00001\x3c/acp\x3e\n`;
+    const decorated = JSON.stringify({
+        model: "gpt-test",
+        messages: [
+            { role: "system", content: `${defaultPrompts.compressPhilosophy}\n\nACP TAGS\n\nrest of the standing prompt` },
+            { role: "user", content: `${tag}hello` },
+        ],
+        stream: false,
+    });
+    const out = stripBiliAcpDecoration(decorated);
+    assert.ok(out, "full compress prompt with no client system is provably bili's");
+    assert.equal(out.strippedSystem, true);
+    assert.equal(out.strippedTags, 1);
+    const messages = (JSON.parse(out.body) as Record<string, unknown>).messages as Array<{ role: string; content: string }>;
+    assert.deepEqual(messages, [{ role: "user", content: "hello" }]);
+});
+
+test("stripBiliAcpDecoration: never touches client-authored text (#6636, fail-safe)", () => {
+    const tag = `\x3cacp tokens="8" type="text"\x3em00001\x3c/acp\x3e\n`;
+    const p = (messages: unknown[]) => JSON.stringify({ model: "m", messages });
+    // Client's own system message — including one merged with bili's prompt.
+    assert.equal(stripBiliAcpDecoration(p([{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: "hi" }])), null, "client system stays");
+    assert.equal(
+        stripBiliAcpDecoration(p([{ role: "system", content: `You are a helpful assistant.\n\n---\n\n${FUNCTION_ACP_TAGS_TIMESTAMPED}` }, { role: "user", content: "hi" }])),
+        null, "merged client+bili system stays — the probe never performs surgery on a merged message",
+    );
+    // No system at all: nothing bili injected to remove.
+    assert.equal(stripBiliAcpDecoration(p([{ role: "user", content: `${tag}hi` }])), null, "no leading system → no strip, even with a tag-looking prefix");
+    // Array-form system content is not bili's shape.
+    assert.equal(stripBiliAcpDecoration(p([{ role: "system", content: [{ type: "text", text: "s" }] }, { role: "user", content: "hi" }])), null);
+    assert.equal(stripBiliAcpDecoration("{not json"), null, "unparseable body → no claim");
+    assert.equal(stripBiliAcpDecoration(JSON.stringify({ model: "m" })), null, "no messages → no claim");
+});
+
+test("stripBiliAcpDecoration: text-parts arrays and tool calls (#6636)", () => {
+    const tag = `\x3cacp tokens="8" type="text"\x3em00001\x3c/acp\x3e\n`;
+    const decorated = JSON.stringify({
+        model: "m",
+        messages: [
+            { role: "system", content: FUNCTION_ACP_TAGS_TIMESTAMPED },
+            { role: "user", content: [{ type: "text", text: `${tag}hello` }] },
+            { role: "assistant", content: `${tag}calling`, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{\"x\": 1}" } }] },
+        ],
+    });
+    const out = stripBiliAcpDecoration(decorated);
+    assert.ok(out);
+    assert.equal(out.strippedTags, 2);
+    const messages = (JSON.parse(out.body) as Record<string, unknown>).messages as Array<Record<string, unknown>>;
+    assert.deepEqual(messages[0]?.content, [{ type: "text", text: "hello" }]);
+    assert.equal(messages[1]?.content, "calling");
+    // Tool-call arguments are user intent — byte-exact, never stripped (#1039).
+    assert.deepEqual(messages[1]?.tool_calls, [{ id: "c1", type: "function", function: { name: "f", arguments: "{\"x\": 1}" } }]);
 });

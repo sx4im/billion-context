@@ -1,5 +1,6 @@
 import type { ProviderRoutes } from "./config.js";
 import { findRoute } from "./config.js";
+import { defaultPrompts } from "acp-kernel";
 
 /** A resolved wire-compat role map: source role → role name upstream accepts. */
 export type CompatRoles = Record<string, string>;
@@ -187,6 +188,124 @@ export function hasOffHeadSystem(body: string, protocol: "openai" | "responses")
     if (systems > 1) return true;
     if (virtualLeading) return true;
     return firstSystemIdx !== firstSlotIdx;
+}
+
+/** #6636 — the bili-injected ACP tags prompt. A leading system message whose
+ *  content starts with this marker is bili's own tags-only standing prompt
+ *  (buildAcpTagsOnlyPrompt: the acpTags section, byte-stable across the
+ *  timestamped/default variants up to the example tag's type attribute).
+ *  Never client prose: the marker is bili's own template text. Written with
+ *  hex escapes per KDD #2 (no literal angle brackets in source). */
+const ACP_TAGS_SYSTEM_MARKER =
+    "ACP TAGS\n\nAddressable messages in the conversation are annotated with a \x3cacp tokens=\"2.1K\" type=\"tool:bash\"";
+
+/** #6636 — detect an upstream 400/422 that exists ONLY because a `system`
+ *  role is forbidden outright on this endpoint (Xiaomi MiMo TTS:
+ *  "messages[0] system role is not allowed for TTS model"). Distinct from
+ *  detectRoleRejection (an unsupported role NAME — the #552 ladder owns
+ *  those) and detectSystemPlacementError (the role is fine, its POSITION is
+ *  wrong — also the ladder's): here the role name is accepted in principle
+ *  and the position is index 0, but the endpoint allows no system message
+ *  at all, so the repair is removal, not re-voicing. Conservative: status
+ *  must be 400/422, the error must blame a system role with a rejection
+ *  word, and when it names a message index that index must be 0 — a
+ *  messages[3] rejection is a mid-history client system, not bili's
+ *  injected head, and the strip probe cannot fix it. */
+const SYSTEM_ROLE_REJECTION_PATTERNS = [
+    /system\s+role\s+is\s+not\s+(allowed|supported|permitted|accepted|valid)/i,
+    /system\s+role\s+not\s+(allowed|supported|permitted|accepted|valid)/i,
+    /system\s+role\b[^.\n]{0,40}\b(forbidden|disallowed|prohibited)\b/i,
+];
+export function detectSystemRoleRejection(status: number, bodyText: string): boolean {
+    if (status !== 400 && status !== 422) return false;
+    const head = bodyText.slice(0, 4096);
+    const indexed = /messages?\[(\d+)\]/.exec(head);
+    if (indexed !== null && Number(indexed[1]) !== 0) return false;
+    return SYSTEM_ROLE_REJECTION_PATTERNS.some((re) => re.test(head));
+}
+
+/** #6636 — a leading <acp> tag prefix as renderMessage emits it:
+ *  `<acp tokens="…" type="…" [time="…"]>mNNNNN</acp>` + newline, anchored
+ *  at the start of the message text. Written with hex escapes per KDD #2. */
+const ACP_TAG_PREFIX_RE = /^\x3cacp tokens="[^"]*" type="[^"]*"(?: time="[^"]*")?\x3em\d+\x3c\/acp\x3e\n?/;
+
+/** Strip one leading tag prefix from a message's text content, when the
+ *  content is a plain string or a text-parts array. Tool-call arguments are
+ *  never touched (#1039) — only the `content` text channel, which is where
+ *  renderMessage stamps the tag. Returns true when a prefix was removed. */
+function stripMessageTagPrefix(msg: Record<string, unknown>): boolean {
+    const content = msg.content;
+    if (typeof content === "string") {
+        if (!ACP_TAG_PREFIX_RE.test(content)) return false;
+        msg.content = content.replace(ACP_TAG_PREFIX_RE, "");
+        return true;
+    }
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+            const p = part as Record<string, unknown>;
+            if (typeof p.text !== "string") continue;
+            if (p.type !== undefined && p.type !== "text") continue;
+            if (!ACP_TAG_PREFIX_RE.test(p.text)) return false;
+            p.text = p.text.replace(ACP_TAG_PREFIX_RE, "");
+            return true;
+        }
+    }
+    return false;
+}
+
+export interface StrippedAcpDecoration {
+    /** The undecorated body, re-serialized. All fields other than messages
+     *  pass through untouched (model, audio, stream, tools, …). */
+    body: string;
+    /** True when the leading system message was bili's own and dropped. */
+    strippedSystem: boolean;
+    /** How many message texts lost a leading <acp> tag prefix. */
+    strippedTags: number;
+}
+
+/** #6636: remove bili's own injected ACP decoration from a serialized
+ *  OpenAI chat-completions body — the leading system message plus the
+ *  leading <acp> tag prefix on each message's text — returning the body
+ *  the client originally sent, as closely as the wire allows. Returns null
+ *  when the body is NOT provably bili-decorated, so the caller never
+ *  strips client-authored text:
+ *   - the leading message must be role:"system" with STRING content
+ *     starting with either the tags-only ACP prompt marker or the default
+ *     compress-philosophy text (the full-prompt lane, client sent no
+ *     system of its own). A client system message — including one merged
+ *     with bili's prompt by injectOpenaiSystem (`client\n\n---\n\nprompt`)
+ *     — matches neither prefix and bails the probe.
+ *   - tag prefixes are stripped only from the text channel (string content
+ *     or first text part); tool-call arguments are never touched (#1039).
+ *  A null return means "do not retry": the 400 is not bili's decoration to
+ *  remove (or not removable without touching client bytes), so the original
+ *  400 stands. */
+export function stripBiliAcpDecoration(body: string): StrippedAcpDecoration | null {
+    let parsed: Record<string, unknown>;
+    try {
+        parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+    const messages = parsed.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+    const head = messages[0];
+    if (!head || typeof head !== "object" || Array.isArray(head)) return null;
+    const headRec = head as Record<string, unknown>;
+    if (headRec.role !== "system") return null;
+    const headText = headRec.content;
+    if (typeof headText !== "string") return null;
+    const isTagsOnly = headText.startsWith(ACP_TAGS_SYSTEM_MARKER);
+    const isFullPrompt = headText.startsWith(defaultPrompts.compressPhilosophy);
+    if (!isTagsOnly && !isFullPrompt) return null;
+    messages.shift();
+    let strippedTags = 0;
+    for (const item of messages) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        if (stripMessageTagPrefix(item as Record<string, unknown>)) strippedTags++;
+    }
+    return { body: JSON.stringify(parsed), strippedSystem: true, strippedTags };
 }
 
 export function applyCompatRoles(

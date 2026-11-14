@@ -18,7 +18,7 @@ import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, detectSystemRoleRejection, hasOffHeadSystem, resolveCompatRoles, stripBiliAcpDecoration, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
 import { compressLoopAnthropicJson } from "../compress-loop-anthropic.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
@@ -1659,6 +1659,85 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             }
                             retried.clearTimer();
                             log("warn", `[${prepared.session.id}] [thinking-posture] strip-and-resend probe also failed (${retried.response.status}) — not the unsigned blocks' fault; original 400 forwarded verbatim, nothing learned (#5998)`);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // [#6636] learn-on-failure undecorated-retry probe: this upstream rejected
+    // the send because a `system` role is not allowed at all (Xiaomi MiMo TTS:
+    // "messages[0] system role is not allowed for TTS model") — and the
+    // leading system message is bili's own injected ACP prompt (tags-only
+    // standing prompt, or the full compress prompt when the client sent no
+    // system of its own). A non-conversational side call (TTS/ASR/embeddings
+    // shim) that merely shares the OpenAI shape gets decorated like a
+    // conversation turn; the classifier (isSideRequest, #6636 audio pin) is
+    // the durable fix for known shapes, but an unknown shape must not surface
+    // as a poisoned third-party 400. Re-send once with bili's own decoration
+    // removed (leading ACP system dropped, leading <acp> tag prefixes
+    // stripped from message text — tool-call arguments are never touched,
+    // #1039). Accepted ⇒ causation confirmed: adopt the retry. Still failing
+    // ⇒ NOT the decoration — discard the second response, forward the
+    // original 400 verbatim, learn nothing (same controlled-experiment
+    // discipline as the #2645 ladder). One attempt per request, no loops, no
+    // persistent memory: a remembered "this origin forbids system" would also
+    // strip real conversation turns, which need the prompt.
+    if (
+        prepared &&
+        !prepared.sidePassthrough &&
+        prepared.protocol === "openai" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let stripErrText: string | null = null;
+        try {
+            stripErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            stripErrText = null;
+        }
+        if (stripErrText !== null) {
+            upstreamResult = {
+                response: new Response(stripErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            if (detectSystemRoleRejection(400, stripErrText)) {
+                const stripped = stripBiliAcpDecoration(wireBody);
+                if (stripped !== null) {
+                    let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
+                    try {
+                        retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(stripped.body) }, undefined, clientAbort.signal);
+                    } catch {
+                        retried = null; // transport failure — inconclusive, original 400 stands
+                    }
+                    if (retried !== null) {
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            // The undecorated bytes are the accepted wire base now —
+                            // track them like the #552/#1900 role hops do, so every
+                            // later same-request re-send derives from what upstream
+                            // actually accepted.
+                            wireBody = stripped.body;
+                            log("info", `[${prepared.session.id}] [acp-strip] upstream rejected the injected ACP system prompt ("${stripErrText.slice(0, 120)}") — re-sent without bili's decoration (dropped leading system, stripped ${stripped.strippedTags} tag prefix(es)), retry accepted (#6636)`);
+                            upstreamResult = retried;
+                        } else {
+                            if (retried.response.body) {
+                                try {
+                                    await readStreamToBuffer(retried.response.body);
+                                } catch {
+                                    /* discarded either way */
+                                }
+                            }
+                            retried.clearTimer();
+                            log("debug", `[${prepared.session.id}] [acp-strip] undecorated retry also failed (${retried.response.status}) — not the decoration's fault; original 400 forwarded (#6636)`);
                         }
                     }
                 }
