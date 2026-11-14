@@ -42,6 +42,7 @@ import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCou
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { outputBudgetField, readOutputBudget, writeOutputBudget } from "./side-request.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
@@ -138,6 +139,17 @@ export async function prepareOpenai(
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
+            // #6752: restoreOutputBudget (handle.ts) mutates parsed BEFORE
+            // prepare, but the fastpath re-derives every scalar field from
+            // the raw wire text below — the restored budget would be
+            // discarded and max_tokens: 1 forwarded while the log reports
+            // success. Carry the already-restored budget across the rebind:
+            // a healthy request is untouched by the restore, so the snapshot
+            // equals the raw value and the write is a no-op there.
+            const restoredBudgetField = outputBudgetField(parsed);
+            const restoredBudget = restoredBudgetField === null
+                ? undefined
+                : readOutputBudget(parsed as Record<string, unknown>, restoredBudgetField);
             const fields: Record<string, unknown> = {};
             for (const [key, span] of wpHit.fieldSpans) {
                 // "messages" keeps its WIRE POSITION (the scanner records it
@@ -147,6 +159,9 @@ export async function prepareOpenai(
                 else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
             }
             parsed = fields as OpenAIRequestBody;
+            if (restoredBudgetField !== null && restoredBudget !== undefined) {
+                writeOutputBudget(parsed as Record<string, unknown>, restoredBudgetField, restoredBudget);
+            }
             inboundMessageCount = wpHit.totalT;
         }
     }
