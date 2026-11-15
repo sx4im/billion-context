@@ -465,9 +465,30 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
+// #6844: top-level `dsh_*` fields are DeepSeek-Harness host metadata — the
+// DSH plugin namespace for provider-side data that stays outside model input
+// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory, and any
+// future field the host adds under its own prefix). The measured-body walks
+// judge what the model receives against the window, so a whole subtree rooted
+// at a top-level `dsh_*` key is skipped. A `dsh_*` key nested below the top
+// level (e.g. inside a message) is model content and still counts.
+function isModelHiddenTopLevelKey(key: string): boolean {
+    return key.startsWith("dsh_");
+}
+
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    // #6844: skip the model-hidden top-level namespace at the root, so this
+    // total stays exactly equal to estimateRawBodyBreakdown's total.
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isModelHiddenTopLevelKey(k)) continue;
+            pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -505,6 +526,7 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isModelHiddenTopLevelKey(k)) continue; // #6844: model-hidden host metadata
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
