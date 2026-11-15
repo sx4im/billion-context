@@ -15,6 +15,31 @@ function isOwnChain(v: unknown): boolean {
     return typeof v === "function" && Object.prototype.hasOwnProperty.call(v, CHAIN_MARKER);
 }
 
+/** #6829: pi-web-access marks its proxy fetch `__piWebAccessProxyFetch`
+ *  (<= 0.45, set unconditionally) or `__piWebAccessSharedProxyFetch`
+ *  (0.46+, its own marker; the old flag is only propagated when the wrapped
+ *  fetch already has it). Either marker identifies a supported coexistence
+ *  wrapper (#2435). */
+function isPiWebAccessFetch(v: unknown): boolean {
+    return typeof v === "function" && (Reflect.get(v, "__piWebAccessProxyFetch") === true || Reflect.get(v, "__piWebAccessSharedProxyFetch") === true);
+}
+
+/** #6829: the inline lane's pseudo-origin — mirror of INLINE_ORIGIN in
+ *  src/inline-engine.ts, kept local so the fetch chain never imports the
+ *  engine's graph. No real DNS entry exists for it: any request that reaches
+ *  a real fetch with this host dies with ENOTFOUND. */
+const INLINE_ORIGIN = "http://billion-context.inline";
+
+function urlOf(input: string | URL | Request): string | undefined {
+    try {
+        if (typeof input === "string") return input;
+        if (input instanceof URL) return input.href;
+        return input.url;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
  *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
  *  bili stops seeing model traffic (documented degradation, visible instead
@@ -163,7 +188,21 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
-                if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);
+                // #6829: the re-entry arrived through a recognized
+                // pi-web-access wrapper that sits ABOVE this link, so the
+                // downstream flag check below cannot see it — and from 0.46
+                // the wrapper marks itself __piWebAccessSharedProxyFetch,
+                // which bili never read. The wrapper already routed this
+                // request once; for pseudo-origin traffic the oldest anchor
+                // cannot serve it at all (a real DNS lookup of a host that
+                // never resolves), so stay in the chain instead of
+                // terminating at the anchor. External traffic keeps the
+                // anchor path below.
+                if (isPiWebAccessFetch(chainHop.getStore())) {
+                    const url = urlOf(input);
+                    if (url !== undefined && url.startsWith(INLINE_ORIGIN)) return send(input, init);
+                }
+                if (isPiWebAccessFetch(ds)) return send(input, init);
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
@@ -181,8 +220,13 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         const chain = patched as typeof globalThis.fetch;
         markOwnChain(chain);
         // Keep the install guard visible, following ds if dead-closure recovery changes it.
+        // #6829: pass both pi-web-access markers through, so a link below a
+        // 0.46+ wrapper still exposes it to the depth-1 check above.
         Object.defineProperty(chain, "__piWebAccessProxyFetch", {
             get: () => Reflect.get(ds, "__piWebAccessProxyFetch"),
+        });
+        Object.defineProperty(chain, "__piWebAccessSharedProxyFetch", {
+            get: () => Reflect.get(ds, "__piWebAccessSharedProxyFetch"),
         });
         return chain;
     };
@@ -223,7 +267,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // leaves; "evict" was the pre-self-heal framing and is dropped
                 // from the wording. Unknown wrappers and any LATER (repeat /
                 // abnormal) marked install keep the full diagnostic below.
-                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true;
+                const webAccess = isPiWebAccessFetch(v);
                 // Visibility (#1158): a third-party install used to be silent —
                 // log it so "un-routed by a third party" is diagnosable. Past
                 // REARM_LIMIT the WARNING stops (log spam), but the adoption
