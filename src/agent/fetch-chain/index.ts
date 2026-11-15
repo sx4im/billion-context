@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { INLINE_ORIGIN } from "../../inline-engine.js";
 import { logHostEvent } from "../host-log.js";
 
 /** Ownership marker for bili's own chain links (#1410). Every function
@@ -94,6 +95,18 @@ export function isDeadClosureError(err: unknown): boolean {
     return err instanceof TypeError && /is not a function$/.test(err.message);
 }
 
+/** Request URL as a string, whatever the fetch input shape (same shape as
+ *  pi-inline.ts). Relative inputs yield undefined rather than throwing. */
+function urlOf(input: string | URL | Request): string | undefined {
+    try {
+        if (typeof input === "string") return input;
+        if (input instanceof URL) return input.href;
+        return input.url;
+    } catch {
+        return undefined;
+    }
+}
+
 function noteFetch(f: unknown): void {
     if (typeof f !== "function") return;
     const fn = f as typeof globalThis.fetch;
@@ -164,6 +177,17 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
                 if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);
+                // #6829: INLINE_ORIGIN traffic must never reach the anchor —
+                // the pseudo-origin is served in-process by the inline
+                // transport and can never DNS-resolve, so the anchor would
+                // fail every model call with ENOTFOUND (pi-web-access 0.46+
+                // no longer sets __piWebAccessProxyFetch, so the coexist
+                // branch above is unreachable and every re-entry landed
+                // here). Route it down the chain instead, where the inline
+                // transport serves it; the anchor escape below stays for
+                // real-world URLs only.
+                const url = urlOf(input);
+                if (url !== undefined && url.startsWith(INLINE_ORIGIN)) return send(input, init);
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
