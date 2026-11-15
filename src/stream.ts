@@ -618,6 +618,55 @@ function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string
     return aLo <= bHi && bLo <= aHi;
 }
 
+// #6809: subtract the submitted spans from the pre-fold offer instead of
+// dropping any offered range a submission merely overlaps — a partial fold of
+// a range's head must still advertise its tail ("compressed 1 of 3 -> show
+// the rest", #2404). Residuals keep the offered range's mix with
+// count/tokens/chars/userMsgs scaled by message span; positional indexes are
+// inherited, so formatRanges still orders/merges them where the offer sat.
+function subtractSubmittedSpans(base: CompressibleRangeItem[], submitted: Array<{ startRef: string; endRef: string }>): CompressibleRangeItem[] {
+    const out: CompressibleRangeItem[] = [];
+    for (const r of base) {
+        const aLo = Math.min(spanNum(r.startRef), spanNum(r.endRef));
+        const aHi = Math.max(spanNum(r.startRef), spanNum(r.endRef));
+        // Unparseable refs carry no span arithmetic — keep the range whole.
+        if (aLo <= 0 || aHi <= 0) {
+            out.push(r);
+            continue;
+        }
+        let intervals: Array<[number, number]> = [[aLo, aHi]];
+        for (const s of submitted) {
+            const cLo = Math.min(spanNum(s.startRef), spanNum(s.endRef));
+            const cHi = Math.max(spanNum(s.startRef), spanNum(s.endRef));
+            const next: Array<[number, number]> = [];
+            for (const [lo, hi] of intervals) {
+                if (!spansOverlap(indexToRef(lo), indexToRef(hi), s.startRef, s.endRef)) {
+                    next.push([lo, hi]);
+                    continue;
+                }
+                if (lo < cLo) next.push([lo, Math.min(hi, cLo - 1)]);
+                if (hi > cHi) next.push([Math.max(lo, cHi + 1), hi]);
+            }
+            intervals = next;
+        }
+        const span = aHi - aLo + 1;
+        for (const [lo, hi] of intervals) {
+            const count = hi - lo + 1;
+            const scale = count / span;
+            out.push({
+                ...r,
+                startRef: indexToRef(lo),
+                endRef: indexToRef(hi),
+                count,
+                tokens: Math.round(r.tokens * scale),
+                chars: r.chars === undefined ? undefined : Math.round(r.chars * scale),
+                userMsgs: r.userMsgs === undefined ? undefined : Math.round(r.userMsgs * scale),
+            });
+        }
+    }
+    return out;
+}
+
 function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
     // Same gates as handleAcpStatus: viability floor + the submit gate's raw char
     // count — never advertise a range the kernel would reject (#847).
@@ -671,8 +720,10 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // Drop the offers this call just folded; everything else stays advertised
     // ("compressed 2 of 3 -> show the 1"). Only when ALL offered folded does the
     // stop signal fire below. Ranges not in the pre-fold offer never appear here.
+    // #6809: subtract, don't drop on overlap — a partial fold of a range's head
+    // leaves its tail advertised; residuals re-run the viability + submit gates.
     const remaining = ctx.lastNudge
-        ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
+        ? viableRanges(subtractSubmittedSpans(base, submitted)).filter(submitGate)
         : base;
     if (remaining.length > 0) {
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
@@ -703,7 +754,12 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
-                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                // #6809: only a lane WITH a pinned pre-fold offer may claim it
+                // was consumed. A lane without one (plugin) never saw an offer,
+                // so asserting "all offered ranges are folded" is false — report
+                // the uncovered mass without the exhaustion claim.
+                const exhausted = ctx.lastNudge ? "all offered ranges are folded, but " : "";
+                return `\n\nUncovered history remains — ${exhausted}${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
             }
         }
     } catch {

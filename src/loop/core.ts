@@ -3,6 +3,7 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import type { HandoffReply } from "../server/handoff-response.js";
 import { estimateCoreMessages } from "../preflight.js";
@@ -233,6 +234,11 @@ export interface LoopCtx {
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
+    /** #6809: this request's prepare-time nudge — the pre-fold offer the model
+     *  acted on. The plugin lane pins its remembered prepare snapshot here so
+     *  postCompressTail bases "remaining ranges" on it (see RewriteCtx.lastNudge,
+     *  src/stream.ts). Lanes without one fall back to the live recompute. */
+    lastNudge?: NudgeDecision;
     session: Session;
     reply?: HandoffReply;
     log: (msg: string) => void;

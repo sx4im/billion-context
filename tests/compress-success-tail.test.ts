@@ -295,3 +295,36 @@ test("#1387: tail recompute still advertises ranges under real pressure (shouldI
     assert.ok(out.includes("m00005"), "the unfolded over-limit range must be listed:\n" + out);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while over-limit ranges remain:\n" + out);
 });
+
+test("#6809: folding only the head of a single offered range still advertises its tail", () => {
+    // Defect B: spansOverlap is a boolean test, so folding m00001–m00004 of an
+    // offered m00001–m00007 dropped the WHOLE range from the receipt even
+    // though m00005–m00007 were never folded. The tail must subtract the
+    // submitted span and keep advertising the residual.
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00007", 7)]);
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes(RANGES_HEADER), "the unfolded tail of the offered range must be advertised:\n" + out);
+    assert.ok(out.includes("m00005"), "the residual tail must be listed:\n" + out);
+    assert.ok(out.includes("m00007"), "the residual tail end must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while a residual remains:\n" + out);
+});
+
+test("#6809: a lane without a pinned offer never claims the offer is exhausted", () => {
+    // Defect A: the plugin lane carries no lastNudge, so after a fold that
+    // pushes pending below the nudge threshold the recompute returns base = []
+    // and the receipt's uncovered audit claimed "all offered ranges are
+    // folded" — but no offer existed in this lane at all. The audit must still
+    // report the uncovered mass, without asserting an offer was consumed.
+    const msgs = Array.from({ length: 14 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs)); // default config — no preserve pin, NO lastNudge (plugin-lane shape)
+    ctx.session.stats.lastInputTokens = 80000;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes("Uncovered history remains"), "the uncovered mass must still be reported:\n" + out);
+    assert.ok(!out.includes("all offered ranges are folded"), "a lane with no pinned offer must never claim the offer is exhausted:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while uncovered mass remains:\n" + out);
+});

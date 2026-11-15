@@ -2492,6 +2492,12 @@ export async function handlePluginTool(
                 // permanent drift against the client's unchanged history
                 // (same split as the relay loop ctx).
                 compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
+                // #6809: pin this request's prepare-time nudge so the compress
+                // receipt bases "remaining ranges" on the offer the model acted
+                // on, exactly like the wire lane's prepared.nudge — without it
+                // the tail falls back to a post-fold recompute that reports an
+                // empty base as "all offered ranges are folded".
+                lastNudge: mem?.nudge,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
