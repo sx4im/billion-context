@@ -295,3 +295,34 @@ test("#1387: tail recompute still advertises ranges under real pressure (shouldI
     assert.ok(out.includes("m00005"), "the unfolded over-limit range must be listed:\n" + out);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while over-limit ranges remain:\n" + out);
 });
+
+test("#6809: folding only the head of a single offered range still advertises its tail", () => {
+    // Defect B: spansOverlap is a boolean overlap test, so the remaining-range
+    // filter drops a WHOLE offered range on ANY overlap with a submitted span.
+    // A partial fold of a range's head must leave the tail advertised ("minus
+    // the submitted spans", stream.ts:1695-1697) — not silently consumed.
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 100000;
+    setOffer(ctx, [offerRange("m00001", "m00007", 7, 14000)]);
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes(RANGES_HEADER), "the unfolded tail of a partly-folded offer must be advertised:\n" + out);
+    assert.ok(out.includes("m00005"), "the residual tail range must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while part of the offer remains:\n" + out);
+});
+
+test("#6809: a lane with no pinned offer never claims the offer is exhausted", () => {
+    // Defect A backstop: without ctx.lastNudge the tail falls back to the live
+    // recompute, and a fold that drops pending below the nudge threshold yields
+    // base = [] — which the uncovered-history sentence then reports as "all
+    // offered ranges are folded". A lane that never had an offer must not assert
+    // its exhaustion, even when material uncovered history remains.
+    const msgs = Array.from({ length: 12 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(8000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 80000;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes("Uncovered history remains"), "shape must exercise the uncovered-history sentence:\n" + out);
+    assert.ok(!out.includes("all offered ranges are folded"), "no-offer lane must never claim the offer is exhausted:\n" + out);
+});
