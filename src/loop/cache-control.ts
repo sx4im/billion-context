@@ -33,6 +33,82 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
 
 const MESSAGE_MARK_CAP = 3;
 
+/** WC-010: Anthropic's cache_control budget is 4 breakpoints per request,
+ *  spanning system blocks + tools entries + message blocks COMBINED. */
+const ANTHROPIC_BREAKPOINT_BUDGET = 4;
+
+/** #6861: pin a client-managed cache_control set with the same cumulative
+ *  discipline as bili's own marks above. Clients rotate their breakpoint
+ *  onto the newest message each request and drop it from the previous one;
+ *  mirroring that rotation verbatim rewrites the un-marked message
+ *  mid-history and breaks the byte prefix exactly there — while the #3023
+ *  client arm cannot see it, because its inbound fingerprints are computed
+ *  over cache-control-stripped CoreMessages, so the seam stays unattributed.
+ *  A marked message therefore STAYS marked until it folds away (liveness is
+ *  judged against the post-turn view); once the budget is full no NEW mark
+ *  is added — the set freezes instead of dropping an old one. The pin store
+ *  lives in session metadata beside `anthropicCacheMarkIds`, as an id ->
+ *  mark-value record (values are the client's own harvested objects, so a
+ *  re-pinned mark re-applies byte-identically). `reservedBreakpoints` counts
+ *  the breakpoints this request already spends outside the message array
+ *  (client system + tools marks); the pinned message set must fit what is
+ *  left of the 4-breakpoint budget. Returns the map coreToAnthropic applies
+ *  — the pinned set, which the round-2 rebuild reuses via the same
+ *  `anthropicCacheMarks ?? anthropicClientCacheControls` source (#2499). */
+export function pinClientCacheMarks(
+    harvested: Map<string, unknown>,
+    processed: { id?: string }[],
+    session: { metadata: Record<string, unknown> },
+    reservedBreakpoints: number,
+): Map<string, unknown> {
+    const liveIds = new Set(processed.map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0));
+    const stored = session.metadata["anthropicPinnedClientCacheMarks"];
+    const kept: Array<[string, unknown]> = [];
+    if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+        for (const [id, value] of Object.entries(stored as Record<string, unknown>)) {
+            if (liveIds.has(id)) kept.push([id, value]);
+        }
+    }
+    const cap = Math.max(0, Math.min(MESSAGE_MARK_CAP, ANTHROPIC_BREAKPOINT_BUDGET - Math.max(0, Math.floor(reservedBreakpoints))));
+    for (const [id, value] of harvested) {
+        if (!liveIds.has(id)) continue;
+        const existing = kept.find(([keptId]) => keptId === id);
+        if (existing) {
+            // Same message, freshest mark value wins; the position never moves.
+            existing[1] = value;
+            continue;
+        }
+        if (kept.length >= cap) break;
+        kept.push([id, value]);
+    }
+    // Trim to the cap when the reserved count grew since the pins were
+    // stored — keep the earliest, they guard the longest prefix.
+    const pinned = kept.slice(0, cap);
+    session.metadata["anthropicPinnedClientCacheMarks"] = Object.fromEntries(pinned);
+    return new Map(pinned);
+}
+
+/** WC-010: count the client's cache_control breakpoints on the top-level
+ *  system field (string systems carry none). */
+export function countAnthropicSystemCacheControl(system: unknown): number {
+    if (!Array.isArray(system)) return 0;
+    let n = 0;
+    for (const b of system) {
+        if (b && typeof b === "object" && (b as { cache_control?: unknown }).cache_control !== undefined) n++;
+    }
+    return n;
+}
+
+/** WC-010: count the client's cache_control breakpoints on tools entries. */
+export function countAnthropicToolsCacheControl(tools: unknown): number {
+    if (!Array.isArray(tools)) return 0;
+    let n = 0;
+    for (const t of tools) {
+        if (t && typeof t === "object" && (t as { cache_control?: unknown }).cache_control !== undefined) n++;
+    }
+    return n;
+}
+
 type AnthropicCacheMarks = Map<string, { type: "ephemeral" }>;
 
 export function computeAnthropicMessageMarks(

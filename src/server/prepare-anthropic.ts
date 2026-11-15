@@ -31,7 +31,7 @@ import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
-import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
+import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnthropicSystemCacheControl, countAnthropicToolsCacheControl, pinClientCacheMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -492,18 +492,31 @@ export async function prepareAnthropic(
         // STABLE message — ephemeral tails (retrievals/sysNotes/nudge/id note)
         // never carry a breakpoint. Client-managed controls (message blocks,
         // tools entries — WC-010's combined budget) pass through untouched.
-        anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
+        const clientManaged = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools);
+        anthropicCacheMarks = clientManaged
             ? undefined
             : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
+        // #6861: a client-managed mark set ROTATES — each request the client
+        // moves its breakpoint onto the newest message and drops it from the
+        // previous one. Mirroring the rotation verbatim rewrites the
+        // un-marked message mid-history and breaks the byte prefix exactly
+        // there (the #1637 class), while the #3023 client arm cannot see it:
+        // its inbound fingerprints are computed over cache-control-stripped
+        // CoreMessages, so the seam stays unattributed. Pin the harvested
+        // client marks with the same cumulative discipline as bili's own, so
+        // a rotation can no longer rewrite history; the round-2 rebuild reuses
+        // this pinned set via `anthropicClientCacheControls` (#2499).
         // #2499: hand the round-2 adapter the SAME marks source the steady path
-        // uses — `anthropicCacheMarks ?? cacheControls`. The client's harvested
+        // uses — `anthropicCacheMarks ?? clientCacheControls`. The client's harvested
         // map is the fallback the rebuild applies when bili adds no marks of its
         // own (a client-managed session), so its trigger-turn breakpoint survives.
-        clientCacheControls = cacheControls;
+        clientCacheControls = clientManaged
+            ? pinClientCacheMarks(cacheControls, processedMessages as { id?: string }[], session, countAnthropicSystemCacheControl(parsed.system) + countAnthropicToolsCacheControl(parsed.tools))
+            : cacheControls;
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
