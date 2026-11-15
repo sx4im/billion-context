@@ -1239,6 +1239,38 @@ _ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                     "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
 # Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
 _LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+# Host-operations hosts bypass the MITM lane by default (#6862): hermes shells out to
+# git/uv/npm for its own update, and those children inherit the host process env —
+# routing them through the lane makes the update fail at the git fetch step. These
+# are the hosts the reporter verified in the ~/.hermes/.env workaround. Arbitrary
+# user remotes stay the operator's NO_PROXY to add (preserved by the merge below).
+_HOST_OPS_NO_PROXY = ("github.com", "api.github.com", "objects.githubusercontent.com",
+                      "codeload.github.com", "pypi.org", "files.pythonhosted.org",
+                      "registry.npmjs.org")
+
+
+def _merged_no_proxy() -> str:
+    """Union the operator's NO_PROXY/no_proxy with loopback + host-ops bypasses (#6862).
+
+    The old setdefault kept an operator-set NO_PROXY verbatim, silently dropping the loopback
+    bypass, and never exempted the code hosts hermes update shells out to. Order: the
+    operator's entries first (their order kept), then loopback, then host-ops; duplicates
+    (case-insensitive — hostnames are) collapse to the first spelling. Idempotent, so a
+    second apply_env over an already-merged value is a no-op.
+    """
+    seen = set()
+    merged = []
+    for key in ("NO_PROXY", "no_proxy"):
+        for entry in (os.environ.get(key) or "").split(","):
+            entry = entry.strip()
+            if entry and entry.lower() not in seen:
+                seen.add(entry.lower())
+                merged.append(entry)
+    for entry in _LOOPBACK_NO_PROXY.split(",") + list(_HOST_OPS_NO_PROXY):
+        if entry.lower() not in seen:
+            seen.add(entry.lower())
+            merged.append(entry)
+    return ",".join(merged)
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1263,8 +1295,12 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
         # the session gets no compression. The proxy forwards absolute-form http requests.
         os.environ["HTTP_PROXY"] = origin
         os.environ["http_proxy"] = origin
-        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
-        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
+        # #6862: union-merge, don't setdefault — an operator-set NO_PROXY used to keep the
+        # loopback bypass out and the code hosts in, so `hermes update`'s git/uv/npm children
+        # routed through the MITM lane and failed. Both cases carry the merged value.
+        merged_no_proxy = _merged_no_proxy()
+        os.environ["NO_PROXY"] = merged_no_proxy
+        os.environ["no_proxy"] = merged_no_proxy
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():

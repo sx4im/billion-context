@@ -773,6 +773,26 @@ elif SCENARIO == "output-limits":
     deadline = __import__("time").monotonic() + 3
     while len(RECORDED["runtime_info"]) < 7 and __import__("time").monotonic() < deadline:
         __import__("time").sleep(0.01)
+elif SCENARIO == "attach-no-proxy-merge":
+    # #6862: apply_env must UNION the operator's own NO_PROXY with the loopback + host-ops
+    # bypass set — the old setdefault kept the operator's list verbatim (loopback silently
+    # lost) and never exempted the code hosts hermes update shells out to (git/uv/npm), so
+    # those children routed through the MITM lane and failed at the git fetch step.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    os.environ["NO_PROXY"] = "corp.example,api.internal"
+    os.environ["no_proxy"] = "corp.example"
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(10)
+    out["merged_no_proxy"] = os.environ.get("NO_PROXY")
+    out["merged_no_proxy_lc"] = os.environ.get("no_proxy")
+    out["merged_https_proxy"] = os.environ.get("HTTPS_PROXY")
+    ctx.run_unload()
+    out["restored_no_proxy"] = os.environ.get("NO_PROXY")
+    out["restored_no_proxy_lc"] = os.environ.get("no_proxy")
+    out["restored_https_proxy"] = os.environ.get("HTTPS_PROXY")
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
@@ -1225,6 +1245,12 @@ interface DriverOut {
     env_http_proxy?: string | null;
     env_http_proxy_lc?: string | null;
     env_no_proxy?: string | null;
+    merged_no_proxy?: string | null;
+    merged_no_proxy_lc?: string | null;
+    merged_https_proxy?: string | null;
+    restored_no_proxy?: string | null;
+    restored_no_proxy_lc?: string | null;
+    restored_https_proxy?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1382,7 +1408,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy_lc, out!.origin);
         assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
         assert.equal(out!.env_http_proxy_lc, out!.origin);
-        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1", "loopback stays direct");
+        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1,github.com,api.github.com,objects.githubusercontent.com,codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org", "loopback stays direct; #6862: code hosts bypass the lane by default");
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1422,6 +1448,29 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    // #6862: apply_env unions the operator's NO_PROXY with the loopback + host-ops bypass
+    // set instead of setdefault-ing loopback-only. Code hosts (git/uv/npm children of
+    // `hermes update`) bypass the MITM lane by default, the operator's own entries survive,
+    // and unload restores the operator's original values one-for-one.
+    test("attach-no-proxy-merge: operator NO_PROXY unioned with loopback + code hosts, restored on unload (#6862)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-no-proxy-merge");
+        assert.ok(out, err);
+        const merged = "corp.example,api.internal,127.0.0.1,localhost,::1,github.com,api.github.com,objects.githubusercontent.com,codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org";
+        assert.equal(out!.merged_no_proxy, merged, "operator entries first, loopback kept, code hosts bypass");
+        assert.equal(out!.merged_no_proxy_lc, merged, "both cases carry the merged value");
+        assert.equal(out!.merged_https_proxy, out!.origin, "model traffic still routed");
+        for (const host of ["github.com", "pypi.org", "registry.npmjs.org"]) {
+            assert.ok(out!.merged_no_proxy!.split(",").includes(host), `${host} bypasses the lane`);
+        }
+        assert.equal(out!.restored_no_proxy, "corp.example,api.internal", "unload restores the operator's NO_PROXY");
+        assert.equal(out!.restored_no_proxy_lc, "corp.example", "unload restores the operator's no_proxy");
+        assert.equal(out!.restored_https_proxy, null, "unload unroutes the proxy");
     });
 
     // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
