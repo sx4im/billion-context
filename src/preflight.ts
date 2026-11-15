@@ -465,9 +465,31 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
+// #6844: DSH host fields are provider metadata, never model input — the
+// `dsh_session_log` field (maxBytes 8 MiB, documented as staying "outside
+// model input") and its sibling `dsh_plugin_packages` are top-level request
+// fields the DSH native plugin attaches for DeepSeek API diagnostics. The
+// measured-body walks below judge the body against the MODEL window, so
+// metering them false-blocks ordinary requests with HTTP 413 (in the
+// reported incident `other` was 88% of the measured body while the
+// model-visible buckets used 28% of budget). The exclusion is by the `dsh_`
+// host namespace, not the two field names, so the next DSH plugin field
+// cannot re-open the incident; it applies at the TOP level only — a `dsh_*`
+// key nested inside messages[] is conversation payload and still counts.
+function isModelHiddenBodyField(key: string): boolean {
+    return key.startsWith("dsh_");
+}
+
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (!isModelHiddenBodyField(k)) pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -505,6 +527,7 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isModelHiddenBodyField(k)) continue; // #6844: model-hidden DSH field, never metered
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
