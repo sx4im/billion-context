@@ -1192,6 +1192,22 @@ export function setPostRebuildAnchor(session: Session, tokens: number): void {
     markDirty(session);
 }
 
+// #6865: the #5974 corrective-probe estimate must never demote an armed
+// overflow baseline — same doctrine as applyPostRebuildBaselineAnchor (#5880)
+// and relay.ts #2484 armFailureShrink. The probe measures a rebuild that
+// may never ship (a corrective pass can fold further, or the probe is
+// reused as the outbound only when it fits), so an optimistic local
+// estimate must not drop the evidence floor that keeps an armed session
+// folding instead of trusting optimistic estimates. Unarmed baselines keep
+// the legacy behavior: a larger probe still raises them.
+export function applyProbeBaselineAnchor(session: Session, probeTextSize: number): void {
+    if (session.stats.lastInputTokensSource === "overflow-arm") return;
+    if (probeTextSize > session.stats.lastInputTokens) {
+        session.stats.lastInputTokens = probeTextSize;
+        session.stats.lastInputTokensSource = "estimate";
+    }
+}
+
 /** Metadata is persisted user-editable JSON — re-validate on read; a corrupt
  *  stamp degrades to "no anchor" (legacy sizing) instead of poisoning the meter. */
 export function postRebuildAnchorTokens(session: Session | undefined): number {
