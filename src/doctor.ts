@@ -306,7 +306,7 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
                 for (const e of listInstances()) {
                     if (isPidAlive(e.pid) && e.port > 0 && e.portReleasedAt === undefined) livePorts.add(e.port);
                 }
-                const warning = claudeAgentRoutingWarning(readOpencodeConfigRoot(process.env), livePorts, lanePreferredPort("opencode"));
+                const warning = claudeAgentRoutingWarning(readOpencodeConfigRoot(process.env) ?? {}, livePorts, lanePreferredPort("opencode"));
                 if (warning !== undefined) row.warnings = [...(row.warnings ?? []), warning];
             } catch {
                 // Config unreadable — nothing to surface, never a probe failure.
