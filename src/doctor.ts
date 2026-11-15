@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isPidAlive, listInstances, procMainScript } from "./instance.js";
-import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectClaudeAgentRouting, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
@@ -292,6 +292,22 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
         const cp = presence.copyVersion !== undefined ? ` v${presence.copyVersion}` : "";
         const p = presence.targets[0] !== undefined ? ` (${presence.targets[0]})` : "";
         row.detail += `; cache copy${p}${cp} is bili-owned and self-updates in place via its own proxy (#1234) — reload/restart OpenCode to activate a disk update`;
+    }
+    if (agent === "opencode" && presence.installed) {
+        // #6816: the built-in claude-agent provider (OpenCode 2.x) drives a
+        // local Claude Code binary and makes no HTTP request from the host,
+        // so the plugin cannot route it — a green lane row hides a silently
+        // inactive provider. Advisory only: never changes the verdict (#2290
+        // pattern). The probe fails open (unreadable config / 1.x host stay
+        // silent), never throws.
+        const routing = inspectClaudeAgentRouting();
+        const warning =
+            routing === "entry-unrouted"
+                ? "providers.claude-agent is configured but its settings.baseURL does not route through bili — the provider drives a local Claude Code binary and makes no HTTP request from OpenCode, so the plugin cannot see its traffic: it runs uncompressed and the mcp__opencode__* tools fail (run 'bili plugin install opencode' to route it) (#6816)"
+                : routing === "builtin-unrouted"
+                    ? "OpenCode 2.x ships the built-in claude-agent provider, which drives a local Claude Code binary and makes no HTTP request from OpenCode — the plugin cannot route it, so claude-agent sessions run uncompressed and the mcp__opencode__* tools fail unless providers.claude-agent.settings.baseURL points at the bili proxy (run 'bili plugin install opencode') (#6816)"
+                    : undefined;
+        if (warning !== undefined) row.warnings = [...(row.warnings ?? []), warning];
     }
     if (agent === "claude" && presence.installed) {
         // #2290: the lane itself is healthy, but a co-installed Claude Desktop

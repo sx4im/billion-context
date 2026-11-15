@@ -4,11 +4,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
-import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
+import { PLUGIN_AGENTS, inspectClaudeAgentRouting, inspectLanePresence } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> | void {
@@ -665,6 +665,119 @@ test("#1577: bili doctor reports a clean advisory state as 'none' and a failed s
                 assert.match(report.global.advisory?.error ?? "", /ENOTFOUND|fetch/i);
                 assert.match(renderDoctorReport(report), /advisory      check failed .*— status unknown/);
             });
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+// — #6816: claude-agent routing warnings ——————————————————————————————
+// The built-in claude-agent provider (OpenCode 2.x) makes no HTTP request
+// from the host, so a green opencode lane hides a silently inactive
+// provider. Doctor must warn (advisory only — the verdict never moves) when
+// the provider is available but unrouted, and stay silent when it is routed
+// or does not exist on the host. Gate discipline (#3617): both directions.
+
+async function doctor6816Report(args: { config: Record<string, unknown>; major: 1 | 2; installed: boolean }): Promise<DoctorReport> {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-6816-"));
+    const ocCfg = path.join(base, "opencode.json");
+    const shimDir = path.join(base, "plugins", "billion-context");
+    if (args.installed) {
+        mkdirSync(shimDir, { recursive: true });
+        writeFileSync(path.join(shimDir, "index.js"), "export { default } from \"/x/dist/agent/opencode-native.js\";\n");
+    }
+    const cfg = args.installed ? { ...args.config, plugins: [shimDir] } : args.config;
+    writeFileSync(ocCfg, JSON.stringify(cfg));
+    const bin = path.join(base, "fake-opencode-6816");
+    writeFileSync(bin, `#!/bin/sh\necho 'opencode ${args.major === 2 ? "2.3.1" : "1.14.46"}'\n`);
+    chmodSync(bin, 0o755);
+    const registryDoc = new Response(JSON.stringify({ name: "billion-context", version: "0.1.143" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+        let report!: DoctorReport;
+        await mockFetch(() => registryDoc)(async () => {
+            await withEnv({
+                HOME: path.join(base, "home"),
+                XDG_CONFIG_HOME: path.join(base, "xdg-config"),
+                XDG_DATA_HOME: path.join(base, "xdg-data"),
+                XDG_CACHE_HOME: path.join(base, "xdg-cache"),
+                XDG_STATE_HOME: path.join(base, "xdg-state"),
+                PI_CODING_AGENT_DIR: undefined,
+                PI_HOME: undefined,
+                DSH_HOME: undefined,
+                HERMES_HOME: undefined,
+                KIMI_CODE_HOME: undefined,
+                CODEX_HOME: undefined,
+                CLAUDE_CONFIG_DIR: undefined,
+                OPENCODE_CONFIG: ocCfg,
+                BILI_CLIENT_BIN: bin,
+            }, async () => {
+                report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+            });
+        });
+        return report;
+    } finally {
+        rmrf(base);
+    }
+}
+
+test("#6816: doctor warns when the 2.x built-in claude-agent provider is unrouted", async () => {
+    const report = await doctor6816Report({ config: {}, major: 2, installed: true });
+    const oc = report.lanes.find((l) => l.agent === "opencode");
+    assert.equal(oc?.verdict, "ok", "the warning is advisory only — the verdict never moves");
+    assert.ok(oc?.warnings?.some((w) => w.includes("built-in claude-agent") && w.includes("makes no HTTP request")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+    assert.match(renderDoctorReport(report), /built-in claude-agent/);
+});
+
+test("#6816: doctor warns when a configured claude-agent baseURL does not route through bili", async () => {
+    const report = await doctor6816Report({ config: { providers: { "claude-agent": { settings: { baseURL: "https://api.anthropic.com" } } } }, major: 2, installed: true });
+    const oc = report.lanes.find((l) => l.agent === "opencode");
+    assert.equal(oc?.verdict, "ok");
+    assert.ok(oc?.warnings?.some((w) => w.includes("providers.claude-agent") && w.includes("does not route through bili")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816: doctor stays silent when claude-agent is routed through bili", async () => {
+    const report = await doctor6816Report({ config: { providers: { "claude-agent": { settings: { baseURL: "http://127.0.0.1:18787/bili/https://api.anthropic.com" } } } }, major: 2, installed: true });
+    const oc = report.lanes.find((l) => l.agent === "opencode");
+    assert.equal(oc?.verdict, "ok");
+    assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `no claude-agent warning when routed: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816: doctor stays silent on a 1.x host — no built-in claude-agent provider there", async () => {
+    const report = await doctor6816Report({ config: {}, major: 1, installed: true });
+    const oc = report.lanes.find((l) => l.agent === "opencode");
+    assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `no claude-agent warning on 1.x: ${JSON.stringify(oc?.warnings)}`);
+});
+
+test("#6816: doctor stays silent when the opencode lane is not installed", async () => {
+    const report = await doctor6816Report({ config: {}, major: 2, installed: false });
+    const oc = report.lanes.find((l) => l.agent === "opencode");
+    assert.equal(oc?.verdict, "absent");
+    assert.equal(oc?.warnings, undefined);
+});
+
+test("#6816 inspectClaudeAgentRouting: probe states match the config on disk", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-6816-probe-"));
+    const ocCfg = path.join(base, "opencode.json");
+    const bin = path.join(base, "fake-opencode-6816");
+    writeFileSync(bin, "#!/bin/sh\necho 'opencode 2.3.1'\n");
+    chmodSync(bin, 0o755);
+    try {
+        await withEnv({ OPENCODE_CONFIG: ocCfg, BILI_CLIENT_BIN: bin }, () => {
+            writeFileSync(ocCfg, JSON.stringify({}));
+            assert.equal(inspectClaudeAgentRouting(), "builtin-unrouted");
+            writeFileSync(ocCfg, JSON.stringify({ providers: { "claude-agent": { settings: { baseURL: "https://api.anthropic.com" } } } }));
+            assert.equal(inspectClaudeAgentRouting(), "entry-unrouted");
+            writeFileSync(ocCfg, JSON.stringify({ providers: { "claude-agent": { settings: { baseURL: "http://127.0.0.1:18787/bili/https://api.anthropic.com" } } } }));
+            assert.equal(inspectClaudeAgentRouting(), "routed");
+            writeFileSync(ocCfg, "{ not json");
+            assert.equal(inspectClaudeAgentRouting(), "not-applicable", "unreadable config fails open, never throws");
+        });
+        const bin1 = path.join(base, "fake-opencode-6816-1x");
+        writeFileSync(bin1, "#!/bin/sh\necho 'opencode 1.14.46'\n");
+        chmodSync(bin1, 0o755);
+        writeFileSync(ocCfg, JSON.stringify({}));
+        await withEnv({ OPENCODE_CONFIG: ocCfg, BILI_CLIENT_BIN: bin1 }, () => {
+            assert.equal(inspectClaudeAgentRouting(), "not-applicable");
         });
     } finally {
         rmrf(base);
