@@ -62,6 +62,58 @@ export function computeAnthropicMessageMarks(
     return marks;
 }
 
+// #6861: pin CLIENT-harvested cache_control marks cumulatively on the steady
+// proxy path. Claude Code stamps a breakpoint on its last message + last
+// assistant message and MOVES them as the conversation grows (#2188); the
+// steady path forwarded the client's CURRENT placement verbatim, so every
+// request stripped the breakpoint off the message that carried it last turn
+// and the outbound prefix broke exactly there (12/12 consecutive pairs in
+// the report, cache hit 8.7% on one request, 119K tokens re-billed). The
+// opencode lane already handles rolling marks via the retouch channel; the
+// steady path had no equivalent. The seam detector cannot see it either —
+// marks live in the harvested map, not in the core messages it fingerprints
+// — so the seam stays "unexplained". Proxy mode ONLY: in plugin mode the
+// host owns the rolling marks and the lane pins "no accumulation", so the
+// call site must not pin there (it would add a third breakpoint to the
+// host's two).
+//
+// The pin applies the #1637 discipline ("a marked message STAYS marked")
+// to the client's own marks: an adopted mark stays on its message until the
+// message leaves the live history (fold/edit), new client marks are adopted
+// in first-seen order up to the same 3-message cap, and the total never
+// grows past the cap. Mid-conversation system marks ride through verbatim
+// (they are not message marks; the frozen client head keeps the top-level
+// system mark stable, #1085/#1876). BILI_NO_CACHE_CONTROL gates bili's OWN
+// stamps only — client marks pass through with or without it — so the pin
+// applies either way; it never invents a mark the client did not place.
+export function pinClientCacheMarks(
+    session: { metadata: Record<string, unknown> },
+    harvested: Map<string, unknown>,
+    liveMessages: readonly { id?: string; role?: string }[],
+): Map<string, unknown> {
+    const liveMessageIds = new Set(liveMessages.filter((m) => m.id && m.role !== "system").map((m) => m.id as string));
+    const liveSystemIds = new Set(liveMessages.filter((m) => m.id && m.role === "system").map((m) => m.id as string));
+    // Pinned message marks: one metadata record, id -> mark value; plain
+    // object string keys keep first-seen order.
+    const stored = session.metadata["anthropicClientCacheMarks"];
+    const pinned: Record<string, unknown> = stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, unknown>) } : {};
+    // Drop marks whose message left the live history (fold/edit).
+    for (const id of Object.keys(pinned)) if (!liveMessageIds.has(id)) delete pinned[id];
+    // Adopt this request's harvested message marks, earliest first, cap 3.
+    for (const [id, mark] of harvested) {
+        if (!liveMessageIds.has(id)) continue;
+        if (!(id in pinned) && Object.keys(pinned).length >= MESSAGE_MARK_CAP) continue;
+        pinned[id] = mark;
+    }
+    session.metadata["anthropicClientCacheMarks"] = pinned;
+    // Outbound map: pinned message marks + this request's live system marks
+    // verbatim (unpinned, uncapped — system marks are a separate budget).
+    const out = new Map<string, unknown>();
+    for (const [id, mark] of Object.entries(pinned)) out.set(id, mark);
+    for (const [id, mark] of harvested) if (liveSystemIds.has(id)) out.set(id, mark);
+    return out;
+}
+
 /** WC-010: Anthropic's 4-breakpoint budget spans system blocks + tools entries
  *  + message blocks COMBINED; anthropicToCore only harvests messages, so a
  *  tools-only client mark must suppress ours too or the 5th breakpoint 400s. */

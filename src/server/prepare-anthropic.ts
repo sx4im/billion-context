@@ -31,7 +31,7 @@ import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
-import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
+import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, pinClientCacheMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -496,14 +496,20 @@ export async function prepareAnthropic(
             ? undefined
             : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
         // #2499: hand the round-2 adapter the SAME marks source the steady path
-        // uses — `anthropicCacheMarks ?? cacheControls`. The client's harvested
+        // uses — `anthropicCacheMarks ?? clientCacheControls`. The client's harvested
         // map is the fallback the rebuild applies when bili adds no marks of its
         // own (a client-managed session), so its trigger-turn breakpoint survives.
-        clientCacheControls = cacheControls;
+        // #6861: PIN the harvested map first — a client that rolls its
+        // breakpoints (Claude Code moves them every turn, #2188) would otherwise
+        // rewrite the outbound prefix at the message that lost its mark.
+        // Proxy mode ONLY: in plugin mode the host owns the rolling marks
+        // (opencode retouch channel) and the lane pins "no accumulation" —
+        // pinning here would add a third breakpoint to the host's two.
+        clientCacheControls = pluginMode ? cacheControls : pinClientCacheMarks(session, cacheControls, processedMessages);
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
