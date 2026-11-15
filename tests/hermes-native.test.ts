@@ -1180,6 +1180,28 @@ elif SCENARIO == "ready-unload":
     mod.register(ctx)
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
+elif SCENARIO == "apply-env-no-proxy":
+    # #6862: apply_env routes model traffic through the lane via process env,
+    # which every host-spawned child inherits — git/uv/npm in hermes update
+    # and shell tasks then route code hosts through the MITM lane and fail.
+    # The bypass hosts must be merged into NO_PROXY/no_proxy (each case from
+    # its own base, operator entries preserved) while model traffic stays
+    # routed; unload must restore the operator's exact values (#5991).
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    os.environ["NO_PROXY"] = "corp.example"
+    os.environ["no_proxy"] = "corp.example"
+    user_proxy = "http://user-proxy.example:9999"
+    os.environ["HTTPS_PROXY"] = user_proxy
+    os.environ["https_proxy"] = user_proxy
+    mod.register(ctx)
+    out["applied_https_proxy"] = os.environ.get("HTTPS_PROXY") == ORIGIN
+    out["applied_no_proxy"] = os.environ.get("NO_PROXY")
+    out["applied_no_proxy_lc"] = os.environ.get("no_proxy")
+    ctx.run_unload()
+    out["restored_no_proxy"] = os.environ.get("NO_PROXY")
+    out["restored_no_proxy_lc"] = os.environ.get("no_proxy")
+    out["restored_https_proxy"] = os.environ.get("HTTPS_PROXY")
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1194,6 +1216,7 @@ out.update({
     "env_http_proxy": os.environ.get("HTTP_PROXY"),
     "env_http_proxy_lc": os.environ.get("http_proxy"),
     "env_no_proxy": os.environ.get("NO_PROXY"),
+    "env_no_proxy_lc": os.environ.get("no_proxy"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
@@ -1225,6 +1248,13 @@ interface DriverOut {
     env_http_proxy?: string | null;
     env_http_proxy_lc?: string | null;
     env_no_proxy?: string | null;
+    env_no_proxy_lc?: string | null;
+    applied_https_proxy?: boolean;
+    applied_no_proxy?: string | null;
+    applied_no_proxy_lc?: string | null;
+    restored_no_proxy?: string | null;
+    restored_no_proxy_lc?: string | null;
+    restored_https_proxy?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1382,7 +1412,12 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy_lc, out!.origin);
         assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
         assert.equal(out!.env_http_proxy_lc, out!.origin);
-        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1", "loopback stays direct");
+        // #6862: loopback stays direct AND the code/dependency hosts the host's
+        // own children reach bypass the lane too, in both NO_PROXY cases.
+        const noProxyMerged = "127.0.0.1,localhost,::1,github.com,api.github.com,"
+            + "objects.githubusercontent.com,codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org";
+        assert.equal(out!.env_no_proxy, noProxyMerged);
+        assert.equal(out!.env_no_proxy_lc, noProxyMerged);
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1927,6 +1962,24 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
         assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
         assert.equal(out!.env_ssl_cert_file, null);
+    });
+
+    test("apply_env merges non-model bypass hosts into NO_PROXY/no_proxy and restores them on unload (#6862)", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("apply-env-no-proxy");
+        assert.ok(out, err);
+        // Model traffic still rides the lane.
+        assert.equal(out!.applied_https_proxy, true, "model traffic stays routed through the origin");
+        // Non-model children (git/uv/npm) bypass it: loopback + the reporter's
+        // verified code-host list, operator entries preserved, both cases agree.
+        const merged = "corp.example,127.0.0.1,localhost,::1,github.com,api.github.com,"
+            + "objects.githubusercontent.com,codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org";
+        assert.equal(out!.applied_no_proxy, merged);
+        assert.equal(out!.applied_no_proxy_lc, merged, "both NO_PROXY cases carry the same merged value");
+        // Unload restores the operator's exact values (#5991).
+        assert.equal(out!.restored_no_proxy, "corp.example");
+        assert.equal(out!.restored_no_proxy_lc, "corp.example");
+        assert.equal(out!.restored_https_proxy, "http://user-proxy.example:9999");
     });
 });
 

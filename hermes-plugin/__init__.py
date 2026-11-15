@@ -1239,6 +1239,36 @@ _ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                     "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
 # Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
 _LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+# Non-model hosts the host process's own children reach (git/uv/npm during
+# `hermes update` and shell tasks, #6862): they must bypass the lane, whose
+# allowlist covers model endpoints only — otherwise a healthy lane breaks every
+# update/shell fetch with `via 127.0.0.1`. The reporter's verified workaround
+# list; keep it to hosts those tools actually hit (github/pypi/npm).
+_NON_MODEL_BYPASS_HOSTS = (
+    "github.com", "api.github.com", "objects.githubusercontent.com",
+    "codeload.github.com", "pypi.org", "files.pythonhosted.org",
+    "registry.npmjs.org",
+)
+
+
+def _merge_no_proxy(existing: Optional[str]) -> str:
+    """Merge the operator's NO_PROXY entries with the loopback + non-model
+    bypass hosts (#6862), preserving operator order and deduping (mirrors the
+    TS lane's applyNoProxyHolds: each case is merged from its own base, so a
+    value the operator set on one case is never silently replaced)."""
+    merged: List[str] = []
+    seen = set()
+    for part in (existing or "").split(","):
+        host = part.strip()
+        key = host.lstrip(".").lower()
+        if host and key not in seen:
+            seen.add(key)
+            merged.append(host)
+    for host in _LOOPBACK_NO_PROXY.split(",") + list(_NON_MODEL_BYPASS_HOSTS):
+        if host.lower() not in seen:
+            seen.add(host.lower())
+            merged.append(host)
+    return ",".join(merged)
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1263,8 +1293,16 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
         # the session gets no compression. The proxy forwards absolute-form http requests.
         os.environ["HTTP_PROXY"] = origin
         os.environ["http_proxy"] = origin
-        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
-        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
+        # #6862: the lane's env is process-wide, so every child the host spawns
+        # afterwards (git/uv/npm in `hermes update`, shell tasks) inherits it —
+        # merge the non-model bypass hosts into NO_PROXY/no_proxy (each case
+        # from its own base, operator entries preserved) so those children go
+        # direct while model traffic stays on the lane. A plain setdefault
+        # would leave an operator-set NO_PROXY without the bypasses, and the
+        # backup taken above still restores the exact pre-apply values on
+        # unload (#5991).
+        os.environ["NO_PROXY"] = _merge_no_proxy(os.environ.get("NO_PROXY"))
+        os.environ["no_proxy"] = _merge_no_proxy(os.environ.get("no_proxy"))
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
