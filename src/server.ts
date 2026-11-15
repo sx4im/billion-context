@@ -4297,7 +4297,10 @@ export async function preflightCompressIfNeeded(
             pendingRebuild = probe;
             const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
             const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
-            if (probeTextSize > session.stats.lastInputTokens) {
+            // #6865: never demote an ACTIVE overflow-arm with a local estimate —
+            // the arm is upstream overflow evidence (the #5880 evidence floor);
+            // the probe may still raise an unarmed baseline.
+            if (probeTextSize > session.stats.lastInputTokens && session.stats.lastInputTokensSource !== "overflow-arm") {
                 session.stats.lastInputTokens = probeTextSize;
                 session.stats.lastInputTokensSource = "estimate";
             }
@@ -4374,7 +4377,10 @@ export async function preflightCompressIfNeeded(
         const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
         remainingImageTokens = rebuiltImageTokens;
         reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
-        if (rebuiltTextSize > session.stats.lastInputTokens) {
+        // #6865: same guard as the #5974 probe above — the rebuilt payload is
+        // the SAME rebuild the probe measured, so this write demotes an active
+        // overflow-arm in the same request when the probe guard holds it.
+        if (rebuiltTextSize > session.stats.lastInputTokens && session.stats.lastInputTokensSource !== "overflow-arm") {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
         }
