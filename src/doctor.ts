@@ -8,11 +8,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { isPidAlive, listInstances, procMainScript } from "./instance.js";
-import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
+import { isPidAlive, lanePreferredPort, listInstances, procMainScript } from "./instance.js";
+import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeAgentRoutingWarning, claudeDesktopPresent, detectOpencodeMajor, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
+import { readOpencodeConfigRoot } from "./client-config.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { convergeDshLedger, dshProfileLedgerFindings, readDshLedgerState, type LedgerChangeDetail, type LedgerFinding } from "./dsh-ledger.js";
 
@@ -292,6 +293,25 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
         const cp = presence.copyVersion !== undefined ? ` v${presence.copyVersion}` : "";
         const p = presence.targets[0] !== undefined ? ` (${presence.targets[0]})` : "";
         row.detail += `; cache copy${p}${cp} is bili-owned and self-updates in place via its own proxy (#1234) — reload/restart OpenCode to activate a disk update`;
+    }
+    if (agent === "opencode" && presence.installed) {
+        // #6816: the built-in claude-agent provider (2.x) makes no HTTP
+        // request from OpenCode, so the plugin rewrite never sees it — a v2
+        // lane with no (or a stale) providers.claude-agent.settings.baseURL
+        // leaves those sessions uncompressed. Advisory only: never change
+        // the verdict.
+        if (detectOpencodeMajor() >= 2) {
+            try {
+                const livePorts = new Set<number>();
+                for (const e of listInstances()) {
+                    if (isPidAlive(e.pid) && e.port > 0 && e.portReleasedAt === undefined) livePorts.add(e.port);
+                }
+                const warning = claudeAgentRoutingWarning(readOpencodeConfigRoot(process.env), livePorts, lanePreferredPort("opencode"));
+                if (warning !== undefined) row.warnings = [...(row.warnings ?? []), warning];
+            } catch {
+                // Config unreadable — nothing to surface, never a probe failure.
+            }
+        }
     }
     if (agent === "claude" && presence.installed) {
         // #2290: the lane itself is healthy, but a co-installed Claude Desktop

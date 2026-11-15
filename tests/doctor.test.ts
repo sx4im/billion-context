@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
@@ -666,6 +666,82 @@ test("#1577: bili doctor reports a clean advisory state as 'none' and a failed s
                 assert.match(renderDoctorReport(report), /advisory      check failed .*— status unknown/);
             });
         });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#6816: opencode lane warns when the claude-agent provider is unrouted or stale, stays silent when routed", async (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-claude-agent-"));
+    const cfgDir = path.join(base, "xdg-config", "opencode");
+    const shimDir = path.join(cfgDir, "plugins", "billion-context");
+    mkdirSync(shimDir, { recursive: true });
+    writeFileSync(path.join(shimDir, "index.js"), "export default {};\n");
+    const bin2 = path.join(base, "fake-opencode-2x");
+    writeFileSync(bin2, "#!/bin/sh\necho 'opencode 2.1.0'\n");
+    // A DIFFERENT bin path from bin2: detectOpencodeMajor caches per command.
+    const bin1 = path.join(base, "fake-opencode-1x");
+    writeFileSync(bin1, "#!/bin/sh\necho 'opencode 1.14.46'\n");
+    chmodSync(bin2, 0o755);
+    chmodSync(bin1, 0o755);
+    const writeCfg = (providers?: unknown): void => {
+        writeFileSync(path.join(cfgDir, "opencode.json"), JSON.stringify({ plugins: [shimDir], ...(providers !== undefined ? { providers } : {}) }, null, 2));
+    };
+    const run = async (bin: string): Promise<DoctorLane | undefined> => {
+        let found: DoctorLane | undefined;
+        await mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "Content-Type": "application/json" } }))(async () => {
+            await withEnv({
+                HOME: path.join(base, "home"),
+                XDG_CONFIG_HOME: path.join(base, "xdg-config"),
+                XDG_DATA_HOME: path.join(base, "xdg-data"),
+                XDG_CACHE_HOME: path.join(base, "xdg-cache"),
+                XDG_STATE_HOME: path.join(base, "xdg-state"),
+                PI_CODING_AGENT_DIR: undefined,
+                PI_HOME: undefined,
+                DSH_HOME: undefined,
+                HERMES_HOME: undefined,
+                KIMI_CODE_HOME: undefined,
+                CODEX_HOME: undefined,
+                CLAUDE_CONFIG_DIR: undefined,
+                OPENCODE_CONFIG: undefined,
+                BILI_CLIENT_BIN: bin,
+            }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                found = report.lanes.find((l) => l.agent === "opencode");
+            });
+        });
+        return found;
+    };
+    try {
+        // Unrouted on a 2.x host: the built-in provider exists but no config
+        // routes it — warn, without touching the verdict.
+        writeCfg();
+        let oc = await run(bin2);
+        assert.equal(oc?.installed, true);
+        const verdictUnrouted = oc?.verdict;
+        assert.ok(oc?.warnings?.some((w) => w.includes("claude-agent") && w.includes("#6816")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+
+        // Routed at the lane's preferred port: silent, same verdict.
+        writeCfg({ "claude-agent": { settings: { baseURL: "http://127.0.0.1:18787/bili/https://api.anthropic.com" } } });
+        oc = await run(bin2);
+        assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+        assert.equal(oc?.verdict, verdictUnrouted, "the advisory never changes the verdict");
+
+        // Stale bili pin (dead port, not the preferred one): stale warning.
+        writeCfg({ "claude-agent": { settings: { baseURL: "http://127.0.0.1:19999/bili/https://api.anthropic.com" } } });
+        oc = await run(bin2);
+        assert.ok(oc?.warnings?.some((w) => w.includes("claude-agent") && w.includes("stale") && w.includes("19999")), `warnings: ${JSON.stringify(oc?.warnings)}`);
+        assert.equal(oc?.verdict, verdictUnrouted);
+
+        // 1.x hosts have no claude-agent provider at all: no warning even
+        // when unrouted.
+        writeCfg();
+        oc = await run(bin1);
+        assert.ok(!oc?.warnings?.some((w) => w.includes("claude-agent")), `warnings: ${JSON.stringify(oc?.warnings)}`);
     } finally {
         rmrf(base);
     }

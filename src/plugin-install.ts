@@ -39,7 +39,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { lanePreferredPort, readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, lanePreferredPort, listInstances, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
@@ -1461,6 +1461,154 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
     return [`${key} -> ${shimDir} (replaced ${replaced.join(", ")})`, note];
 }
 
+// #6816: OpenCode v2's built-in Claude Agent provider (claude-agent/*)
+// drives a local Claude Code binary and makes NO HTTP request from
+// OpenCode, so the native plugin's http.request rewrite never sees its
+// traffic — the provider is silently inactive (no compression, and the
+// `mcp__opencode__*` tools fail with "no ACP state for this session yet").
+// The only routing seam is the provider's own config:
+// providers.claude-agent.settings.baseURL (verified live by the reporter
+// on 0.1.215 — a routed compress folded m00001–m00010 and cut usage
+// 57% → 29%). Install writes it, remove takes it back, doctor warns when
+// it is missing or stale. The OpenCode ses_… id vs Claude session UUID
+// mismatch is a separate concern — noted, not fixed here.
+export const CLAUDE_AGENT_PROVIDER_ID = "claude-agent";
+const CLAUDE_AGENT_UPSTREAM = "https://api.anthropic.com";
+
+/** The proxy URL a claude-agent baseURL must point at for `port`. Same
+ *  shape as launcher.wrapUpstream(origin, upstream) — built inline
+ *  because launcher.ts imports this module (importing it back would
+ *  cycle). */
+export function claudeAgentBiliBaseUrl(port: number): string {
+    return `http://127.0.0.1:${port}/bili/${CLAUDE_AGENT_UPSTREAM}`;
+}
+
+/** #6816: the opencode lane's proxy port RIGHT NOW — a live opencode-lane
+ *  instance's port when one is running (a drifted port is the truth while
+ *  the proxy is up, #5127/#5129), else the lane's sticky preferred port
+ *  (port-zone record, else the zone base 18787). Never a hardcoded port. */
+export function opencodeLaneProxyPort(): number {
+    try {
+        for (const e of listInstances()) {
+            if (e.lane === "opencode" && e.port > 0 && isPidAlive(e.pid) && e.portReleasedAt === undefined) return e.port;
+        }
+    } catch {
+        // Registry unreadable — fall through to the sticky record.
+    }
+    return lanePreferredPort("opencode");
+}
+
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+}
+
+/** The claude-agent provider's settings object in a parsed opencode
+ *  config root, or undefined when the shape is absent / not an object. */
+function claudeAgentSettings(data: Record<string, unknown>): Record<string, unknown> | undefined {
+    const providers = asRecord(data.providers);
+    if (providers === undefined) return undefined;
+    const entry = asRecord(providers[CLAUDE_AGENT_PROVIDER_ID]);
+    if (entry === undefined) return undefined;
+    return asRecord(entry.settings);
+}
+
+/** The claude-agent provider's configured baseURL, if it is a string. */
+export function claudeAgentBaseUrl(data: Record<string, unknown>): string | undefined {
+    const v = claudeAgentSettings(data)?.baseURL;
+    return typeof v === "string" ? v : undefined;
+}
+
+/** #6816: route the claude-agent provider through the proxy — writes
+ *  providers["claude-agent"].settings.baseURL, merge-preserving (other
+ *  providers and other settings keys survive). Never clobbers a user-set
+ *  baseURL that does not point at bili; re-pins a stale bili URL to the
+ *  live port. Returns install notes (non-empty even when nothing changed,
+ *  so the caller reports what happened). */
+export function applyClaudeAgentProviderEntry(data: Record<string, unknown>, baseUrl: string): string[] {
+    const providers = asRecord(data.providers);
+    if (providers === undefined && data.providers !== undefined) {
+        return ["claude-agent routing skipped ('providers' is not an object)"];
+    }
+    const prov = providers ?? (data.providers = {} as Record<string, unknown>);
+    const entry = asRecord(prov[CLAUDE_AGENT_PROVIDER_ID]);
+    if (entry === undefined && prov[CLAUDE_AGENT_PROVIDER_ID] !== undefined) {
+        return ["claude-agent routing skipped (providers.claude-agent is not an object)"];
+    }
+    const ent = entry ?? (prov[CLAUDE_AGENT_PROVIDER_ID] = {} as Record<string, unknown>);
+    const settings = asRecord(ent.settings);
+    if (settings === undefined && ent.settings !== undefined) {
+        return ["claude-agent routing skipped (providers.claude-agent.settings is not an object)"];
+    }
+    const set = settings ?? (ent.settings = {} as Record<string, unknown>);
+    const cur = set.baseURL;
+    if (typeof cur === "string" && cur === baseUrl) {
+        return [`claude-agent already routed (${baseUrl})`];
+    }
+    if (typeof cur === "string" && isBiliClaudeBaseUrl(cur)) {
+        set.baseURL = baseUrl;
+        return [`claude-agent baseURL re-pinned to ${baseUrl} (was ${cur})`];
+    }
+    if (typeof cur === "string") {
+        return [`claude-agent baseURL left alone (user-set ${cur} — not a bili URL)`];
+    }
+    set.baseURL = baseUrl;
+    return [`providers.claude-agent.settings.baseURL -> ${baseUrl} (claude-agent provider routed through the proxy; #6816)`];
+}
+
+/** #6816: remove ONLY a bili-written claude-agent baseURL on uninstall. A
+ *  user-set baseURL is never touched; empty settings / provider /
+ *  providers objects are pruned so remove restores the pre-install shape.
+ *  Returns notes; empty when there was nothing of ours to remove. */
+export function removeClaudeAgentProviderEntry(data: Record<string, unknown>): string[] {
+    const providers = asRecord(data.providers);
+    if (providers === undefined) return [];
+    const entry = asRecord(providers[CLAUDE_AGENT_PROVIDER_ID]);
+    if (entry === undefined) return [];
+    const settings = asRecord(entry.settings);
+    if (settings === undefined) return [];
+    const cur = settings.baseURL;
+    if (typeof cur !== "string" || !isBiliClaudeBaseUrl(cur)) return [];
+    delete settings.baseURL;
+    if (Object.keys(settings).length === 0) delete entry.settings;
+    if (Object.keys(entry).length === 0) delete providers[CLAUDE_AGENT_PROVIDER_ID];
+    if (Object.keys(providers).length === 0) delete data.providers;
+    return [`providers.claude-agent.settings.baseURL removed (${cur}; #6816)`];
+}
+
+export type ClaudeAgentRouting = "routed" | "unrouted" | "stale";
+
+/** #6816: classify the claude-agent provider's routing from a merged
+ *  opencode config root. `livePorts` are the ports of currently-alive
+ *  proxy instances; a bili pin counts as routed when its port is live now
+ *  or is the lane's preferred (next-launch) port, stale when it matches
+ *  neither. */
+export function claudeAgentRouting(data: Record<string, unknown>, livePorts: ReadonlySet<number>, preferredPort: number): { state: ClaudeAgentRouting; baseUrl?: string; port?: number } {
+    const baseUrl = claudeAgentBaseUrl(data);
+    if (baseUrl === undefined) return { state: "unrouted" };
+    if (!isBiliClaudeBaseUrl(baseUrl)) return { state: "unrouted", baseUrl };
+    let port: number | undefined;
+    try {
+        const parsed = Number(new URL(baseUrl).port);
+        port = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+    } catch {
+        port = undefined;
+    }
+    if (port !== undefined && (livePorts.has(port) || port === preferredPort)) return { state: "routed", baseUrl, port };
+    return { state: "stale", baseUrl, port };
+}
+
+/** #6816: the doctor advisory for a claude-agent provider that is not
+ *  routed through bili — undefined when routed. Advisory only: the caller
+ *  never changes the lane verdict. */
+export function claudeAgentRoutingWarning(data: Record<string, unknown>, livePorts: ReadonlySet<number>, preferredPort: number): string | undefined {
+    const { state, port } = claudeAgentRouting(data, livePorts, preferredPort);
+    if (state === "routed") return undefined;
+    if (state === "stale") {
+        return `claude-agent provider points at a stale bili port ${port ?? "?"} with no live proxy — rerun \`bili plugin install opencode\` to re-pin it to the live lane port (#6816)`;
+    }
+    return "claude-agent provider is not routed through bili — its sessions bypass the proxy (no compression, and the bili tools fail with 'no ACP state for this session yet'); run `bili plugin install opencode` to route it (#6816)";
+}
+
 function opencodeInstall(withMcp = false): string {
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
@@ -1549,6 +1697,19 @@ function opencodeInstall(withMcp = false): string {
         notes.push("compaction.auto set to false");
     }
 
+    // #6816: the built-in claude-agent provider makes no HTTP request from
+    // OpenCode, so the plugin rewrite never sees it — route it at the config
+    // level. 2.x hosts only: 1.x has no claude-agent provider. The port is
+    // the live lane port when a proxy is up, else the sticky preferred port
+    // (never hardcoded — the port drifts, #5127/#5129).
+    if (detectOpencodeMajor() >= 2) {
+        const beforeProviders = JSON.stringify(data.providers ?? null);
+        notes.push(...applyClaudeAgentProviderEntry(data, claudeAgentBiliBaseUrl(opencodeLaneProxyPort())));
+        if (JSON.stringify(data.providers ?? null) !== beforeProviders) touched.add("providers");
+    } else {
+        notes.push("claude-agent routing skipped (OpenCode 1.x has no claude-agent provider; #6816)");
+    }
+
     writeOpencodeConfig(file, original, data, touched);
     return `opencode: installed -> ${file} (${notes.join("; ")})`;
 }
@@ -1599,6 +1760,15 @@ function opencodeRemove(): string {
     if (removed.length > 0) {
         if (removed.includes(dir)) fs.rmSync(dir, { recursive: true, force: true });
         notes.push(`plugin removed (${removed.join(", ")})`);
+    }
+
+    // #6816: take back the claude-agent routing written at install time.
+    // Only a bili-pointing baseURL is removed; a user-set one survives.
+    {
+        const beforeProviders = JSON.stringify(data.providers ?? null);
+        const claudeNotes = removeClaudeAgentProviderEntry(data);
+        if (JSON.stringify(data.providers ?? null) !== beforeProviders) touched.add("providers");
+        notes.push(...claudeNotes);
     }
 
     if (notes.length > 0) {

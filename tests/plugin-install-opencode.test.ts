@@ -4,12 +4,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+    applyClaudeAgentProviderEntry,
     applyOpencodePluginEntry,
+    claudeAgentRouting,
+    claudeAgentRoutingWarning,
     isNpmInstallForm,
     OPENCODE_NPM_ENTRY,
     pluginInstall,
     pluginRemove,
     pluginStatusAll,
+    removeClaudeAgentProviderEntry,
     selfPackageRoot,
 } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -372,4 +376,214 @@ test("#926 --with-mcp strips a stale pin from an existing entry but keeps the en
     assert.equal(bili!.environment, undefined);
     assert.deepEqual(bili!.command, ["/usr/bin/node", "/opt/old/dist/mcp.js"]);
     assert.equal(bili!.enabled, true);
+});
+
+// #6816: the built-in Claude Agent provider (claude-agent/*) drives a local
+// Claude Code binary and makes NO HTTP request from OpenCode, so the native
+// plugin's http.request rewrite never sees its traffic. Install routes it
+// via providers.claude-agent.settings.baseURL; remove takes it back.
+
+const CLAUDE_BILI_URL = "http://127.0.0.1:18787/bili/https://api.anthropic.com";
+const CLAUDE_STALE_URL = "http://127.0.0.1:19999/bili/https://api.anthropic.com";
+
+type ProvidersCfg = {
+    providers?: Record<string, { settings?: Record<string, unknown> } & Record<string, unknown>> & Record<string, unknown>;
+};
+
+function claudeBaseUrl(data: Record<string, unknown>): unknown {
+    const providers = (data as ProvidersCfg).providers;
+    if (providers === null || typeof providers !== "object" || Array.isArray(providers)) return undefined;
+    const entry = providers["claude-agent"];
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const settings = entry.settings;
+    if (settings === null || typeof settings !== "object" || Array.isArray(settings)) return undefined;
+    return settings.baseURL;
+}
+
+test("#6816 applyClaudeAgentProviderEntry: writes the provider baseURL on an empty config", () => {
+    const data: Record<string, unknown> = {};
+    const notes = applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    assert.equal(claudeBaseUrl(data), CLAUDE_BILI_URL);
+    assert.ok(notes.some((n) => n.includes("claude-agent") && n.includes(CLAUDE_BILI_URL)), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 applyClaudeAgentProviderEntry: preserves other providers and other settings keys", () => {
+    const data: Record<string, unknown> = { providers: { openai: { settings: { apiKey: "k", baseURL: "https://example.com/v1" } }, "claude-agent": { settings: { apiKey: "user-key" } } } };
+    applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    const providers = data.providers as Record<string, Record<string, Record<string, unknown>>>;
+    assert.equal(providers.openai.settings.apiKey, "k");
+    assert.equal(providers.openai.settings.baseURL, "https://example.com/v1");
+    assert.equal(providers["claude-agent"].settings.apiKey, "user-key");
+    assert.equal(providers["claude-agent"].settings.baseURL, CLAUDE_BILI_URL);
+});
+
+test("#6816 applyClaudeAgentProviderEntry: idempotent when already routed", () => {
+    const data: Record<string, unknown> = { providers: { "claude-agent": { settings: { baseURL: CLAUDE_BILI_URL } } } };
+    const before = JSON.stringify(data);
+    const notes = applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    assert.equal(JSON.stringify(data), before);
+    assert.ok(notes.some((n) => /already routed/.test(n)), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 applyClaudeAgentProviderEntry: re-pins a stale bili URL to the live port", () => {
+    const data: Record<string, unknown> = { providers: { "claude-agent": { settings: { baseURL: CLAUDE_STALE_URL } } } };
+    const notes = applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    assert.equal(claudeBaseUrl(data), CLAUDE_BILI_URL);
+    assert.ok(notes.some((n) => /re-pinned/.test(n) && n.includes("19999")), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 applyClaudeAgentProviderEntry: never clobbers a user-set non-bili baseURL", () => {
+    const data: Record<string, unknown> = { providers: { "claude-agent": { settings: { baseURL: "https://api.anthropic.com" } } } };
+    const notes = applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    assert.equal(claudeBaseUrl(data), "https://api.anthropic.com");
+    assert.ok(notes.some((n) => /left alone/.test(n)), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 applyClaudeAgentProviderEntry: skips a non-object providers value instead of destroying it", () => {
+    const data: Record<string, unknown> = { providers: "not-an-object" };
+    const notes = applyClaudeAgentProviderEntry(data, CLAUDE_BILI_URL);
+    assert.equal(data.providers, "not-an-object");
+    assert.ok(notes.some((n) => /skipped/.test(n)), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 removeClaudeAgentProviderEntry: removes a bili baseURL and prunes the empty keys", () => {
+    const data: Record<string, unknown> = { providers: { "claude-agent": { settings: { baseURL: CLAUDE_BILI_URL } } }, model: "anthropic/claude" };
+    const notes = removeClaudeAgentProviderEntry(data);
+    assert.equal(data.providers, undefined);
+    assert.equal(data.model, "anthropic/claude");
+    assert.ok(notes.some((n) => n.includes("claude-agent")), `notes: ${notes.join("; ")}`);
+});
+
+test("#6816 removeClaudeAgentProviderEntry: keeps sibling providers and sibling settings", () => {
+    const data: Record<string, unknown> = { providers: { openai: { settings: { baseURL: "https://example.com/v1" } }, "claude-agent": { settings: { apiKey: "k", baseURL: CLAUDE_BILI_URL } } } };
+    removeClaudeAgentProviderEntry(data);
+    const providers = data.providers as Record<string, Record<string, Record<string, unknown>>>;
+    assert.equal(providers["claude-agent"].settings.apiKey, "k");
+    assert.equal(providers["claude-agent"].settings.baseURL, undefined);
+    assert.equal(providers.openai.settings.baseURL, "https://example.com/v1");
+});
+
+test("#6816 removeClaudeAgentProviderEntry: never touches a user-set non-bili baseURL", () => {
+    const data: Record<string, unknown> = { providers: { "claude-agent": { settings: { baseURL: "https://api.anthropic.com" } } } };
+    assert.deepEqual(removeClaudeAgentProviderEntry(data), []);
+    assert.equal(claudeBaseUrl(data), "https://api.anthropic.com");
+});
+
+test("#6816 removeClaudeAgentProviderEntry: no-op on a config without the entry", () => {
+    const data: Record<string, unknown> = { model: "anthropic/claude" };
+    assert.deepEqual(removeClaudeAgentProviderEntry(data), []);
+});
+
+test("#6816 claudeAgentRouting: routed on a live port or the preferred port, stale on a dead bili port, unrouted otherwise", () => {
+    const live = new Set([18788]);
+    assert.equal(claudeAgentRouting({ providers: { "claude-agent": { settings: { baseURL: "http://127.0.0.1:18788/bili/https://api.anthropic.com" } } } }, live, 18787).state, "routed");
+    assert.equal(claudeAgentRouting({ providers: { "claude-agent": { settings: { baseURL: CLAUDE_BILI_URL } } } }, live, 18787).state, "routed");
+    assert.equal(claudeAgentRouting({ providers: { "claude-agent": { settings: { baseURL: CLAUDE_STALE_URL } } } }, live, 18787).state, "stale");
+    assert.equal(claudeAgentRouting({}, live, 18787).state, "unrouted");
+    assert.equal(claudeAgentRouting({ providers: { "claude-agent": { settings: { baseURL: "https://api.anthropic.com" } } } }, live, 18787).state, "unrouted");
+});
+
+test("#6816 claudeAgentRoutingWarning: advisory text for unrouted and stale, silence when routed", () => {
+    const live = new Set<number>();
+    const unrouted = claudeAgentRoutingWarning({}, live, 18787);
+    assert.ok(unrouted !== undefined && unrouted.includes("claude-agent") && unrouted.includes("#6816"), `warning: ${unrouted}`);
+    const stale = claudeAgentRoutingWarning({ providers: { "claude-agent": { settings: { baseURL: CLAUDE_STALE_URL } } } }, live, 18787);
+    assert.ok(stale !== undefined && stale.includes("stale") && stale.includes("19999"), `warning: ${stale}`);
+    assert.equal(claudeAgentRoutingWarning({ providers: { "claude-agent": { settings: { baseURL: CLAUDE_BILI_URL } } } }, live, 18787), undefined);
+});
+
+test("#6816 pluginInstall opencode under a 2.x host writes the claude-agent provider baseURL, remove takes it back", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevState = process.env.XDG_STATE_HOME;
+    const prevOpen = process.env.OPENCODE_CONFIG;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    delete process.env.OPENCODE_CONFIG;
+    const xdg = tempDir("bili-oc-6816-xdg-");
+    const state = tempDir("bili-oc-6816-state-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.XDG_STATE_HOME = state;
+    const bin = path.join(xdg, "fake-opencode-6816");
+    fs.writeFileSync(bin, "#!/bin/sh\necho 'opencode 2.1.0'\n");
+    fs.chmodSync(bin, 0o755);
+    process.env.BILI_CLIENT_BIN = bin;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+        if (prevState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevState;
+        if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
+        else process.env.OPENCODE_CONFIG = prevOpen;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(xdg);
+        rmrf(state);
+    });
+
+    const file = path.join(xdg, "opencode", "opencode.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ model: "anthropic/claude" }, null, 2));
+    const read = (): Record<string, unknown> => JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+
+    const out = pluginInstall("opencode");
+    assert.match(out, /claude-agent/);
+    assert.equal(claudeBaseUrl(read()), CLAUDE_BILI_URL);
+
+    // Reinstall is idempotent — the entry survives untouched.
+    pluginInstall("opencode");
+    assert.equal(claudeBaseUrl(read()), CLAUDE_BILI_URL);
+
+    const rem = pluginRemove("opencode");
+    assert.match(rem, /claude-agent/);
+    const after = read();
+    assert.equal(after.providers, undefined, "remove prunes the providers key it created");
+});
+
+test("#6816 pluginInstall prefers a live opencode-lane instance's port over the sticky record", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevState = process.env.XDG_STATE_HOME;
+    const prevOpen = process.env.OPENCODE_CONFIG;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    delete process.env.OPENCODE_CONFIG;
+    const xdg = tempDir("bili-oc-6816-live-xdg-");
+    const state = tempDir("bili-oc-6816-live-state-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.XDG_STATE_HOME = state;
+    const bin = path.join(xdg, "fake-opencode-6816-live");
+    fs.writeFileSync(bin, "#!/bin/sh\necho 'opencode 2.1.0'\n");
+    fs.chmodSync(bin, 0o755);
+    process.env.BILI_CLIENT_BIN = bin;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+        if (prevState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevState;
+        if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
+        else process.env.OPENCODE_CONFIG = prevOpen;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(xdg);
+        rmrf(state);
+    });
+
+    // A live opencode-lane proxy drifted to 18788; the sticky record (absent
+    // here) would say 18787. The install must pin the live port.
+    const instancesDir = path.join(state, "billion-context", "instances");
+    fs.mkdirSync(instancesDir, { recursive: true });
+    fs.writeFileSync(path.join(instancesDir, "live-opencode.json"), JSON.stringify({ instanceId: "live-opencode", pid: process.pid, port: 18788, origin: "http://127.0.0.1:18788", startedAt: Date.now(), lane: "opencode" }));
+
+    const file = path.join(xdg, "opencode", "opencode.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ model: "anthropic/claude" }, null, 2));
+
+    pluginInstall("opencode");
+    const cfg = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    assert.equal(claudeBaseUrl(cfg), "http://127.0.0.1:18788/bili/https://api.anthropic.com");
 });
