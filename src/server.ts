@@ -3755,11 +3755,23 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
+// #6828: the billable (model-visible) part of a metered body — what the
+// upstream actually charges input tokens for. The #554 meter walks EVERY
+// string field, so `other` holds model-invisible top-level fields (metadata,
+// parameters, a host-side snapshot) that no upstream bills; judging the raw
+// total against the model window false-trips the doom gates on bodies that
+// fit (reported: 1.8M metered vs ~380K billed). Protocol-aware bucketing
+// puts the conversation and system prompt in the visible buckets on every
+// wire, so this sum is the billable total.
+export function measuredVisibleTokens(b: RawBodyBreakdown): number {
+    return b.messages + b.tools + b.system;
+}
+
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown; protocol?: WireProtocol }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
@@ -3769,7 +3781,7 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
             return undefined;
         }
     }
-    const breakdown = estimateRawBodyBreakdown(parsed);
+    const breakdown = estimateRawBodyBreakdown(parsed, prepared.protocol);
     return { tokens: breakdown.total, breakdown };
 }
 
@@ -4490,11 +4502,13 @@ export async function preflightCompressIfNeeded(
     // fallbacks stay binding for those bodies.
     let outboundBudgetTokens: number | undefined;
     let outboundRawTokens: number | undefined;
+    let outboundVisibleTokens: number | undefined;
     let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundBreakdown = estimateRawBodyBreakdown(outBody);
+        outboundBreakdown = estimateRawBodyBreakdown(outBody, prepared.protocol);
         outboundRawTokens = outboundBreakdown.total;
+        outboundVisibleTokens = measuredVisibleTokens(outboundBreakdown);
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
         if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
@@ -4527,7 +4541,9 @@ export async function preflightCompressIfNeeded(
         // that. The #554 meter excludes image payloads (image_url/data/url/...),
         // so `outboundRawTokens` is text-only by construction.
         const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+        // #6828: judge the billable subtotal — the raw total counts
+        // model-invisible `other` fields no upstream bills.
+        if (outboundVisibleTokens !== undefined && outboundVisibleTokens > armMeasuredBar) {
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
             const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
@@ -4630,7 +4646,8 @@ export async function preflightCompressIfNeeded(
         // Same text-only rule as the #1839 arm above: image-dominated overage
         // belongs to the #496/#1800 billing arbitration, never to a local doom.
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+        // #6828: judge the billable subtotal — same reason as the #1839 arm.
+        if (outboundVisibleTokens !== undefined && outboundVisibleTokens > gateMeasuredBar) {
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
             const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);

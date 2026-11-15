@@ -269,3 +269,34 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
         rmrf(root);
     }
 });
+
+test("e2e #6828: a body whose mass rides a model-invisible top-level field still forwards — the fuse judges the billable content, not the metered total", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6828-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // Incident #6828's shape: the host re-sends a multi-MB snapshot
+        // under a top-level metadata field while the model-visible content
+        // (messages/tools/system) is ~201K tokens — far under the window.
+        // The #554 meter prices every string field, so the raw total reads
+        // ~1.8M against the floored 1M bar; the fuse must judge the billable
+        // subtotal and forward. No `model` in the body → preflight skipped,
+        // the relay fuse is the last line (same shape as #4079/#4543).
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                system: "sys",
+                messages: [{ role: "user", content: "数".repeat(126_000) }],
+                tools: [{ type: "function", function: { name: "f", description: "d".repeat(300_000) } }],
+                metadata: { snapshot: "a".repeat(1_602_302 * 4) },
+            }),
+        });
+        assert.equal(r.status, 200, `other-dominated fitting body must forward (got ${r.status}): ${(await r.text()).slice(0, 300)}`);
+        assert.equal(calls.length, 1, "the request reached the upstream");
+        assert.ok(calls[0]!.bytes > 6_000_000, `the multi-MB body really was forwarded (got ${calls[0]!.bytes}B)`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});

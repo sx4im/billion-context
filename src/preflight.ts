@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
@@ -491,7 +491,15 @@ export function estimateRawBodyTokens(parsed: unknown): number {
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed) exactly.
+ *  #6828: the conversation/system keys differ by wire, so the bucket split
+ *  takes the protocol: messages/input/contents land in `messages`,
+ *  system/instructions/systemInstruction in `system`, tools in `tools`.
+ *  `messages + tools + system` is then the billable (model-visible) subtotal
+ *  on every protocol — the doom gates judge that, never the raw total, since
+ *  `other` holds model-invisible fields (model name, parameters, metadata,
+ *  host-side snapshots) that no upstream bills. No protocol keeps the legacy
+ *  openai-shaped mapping. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
@@ -500,12 +508,14 @@ export interface RawBodyBreakdown {
     other: number;
 }
 
-export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+export function estimateRawBodyBreakdown(parsed: unknown, protocol?: WireProtocol): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
+    const conversationKey = protocol === "responses" ? "input" : protocol === "google" ? "contents" : "messages";
+    const systemKey = protocol === "responses" ? "instructions" : protocol === "google" ? "systemInstruction" : "system";
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            const bucket = k === conversationKey ? 0 : k === "tools" ? 1 : k === systemKey ? 2 : 3;
             pending.push([v, k, bucket]);
         }
     } else {

@@ -84,3 +84,71 @@ test("non-object top-level bodies land whole in the other bucket", () => {
     assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body") });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
 });
+
+// #6828: the conversation/system top-level keys differ by wire — the
+// breakdown's messages/system buckets must hold the model-visible content
+// on every protocol, so `messages + tools + system` is the billable
+// subtotal the doom gates judge; `other` is then exactly the
+// model-invisible remainder. `total` still equals estimateRawBodyTokens.
+test("raw-body breakdown buckets the conversation/system keys per protocol (#6828)", () => {
+    const responses = {
+        model: "deepseek-flash",
+        input: [{ type: "message", role: "user", content: "hello response" }],
+        instructions: "be helpful",
+        tools: [{ type: "function", name: "search" }],
+        metadata: { note: "structural note" },
+    };
+    const bdR = estimateRawBodyBreakdown(responses, "responses");
+    assert.equal(bdR.messages, t("message") + t("user") + t("hello response"));
+    assert.equal(bdR.system, t("be helpful"));
+    assert.equal(bdR.tools, t("function") + t("search"));
+    assert.equal(bdR.other, t("deepseek-flash") + t("structural note"));
+    assert.equal(bdR.total, estimateRawBodyTokens(responses));
+
+    const google = {
+        model: "deepseek-flash",
+        contents: [{ role: "user", parts: [{ text: "hello google" }] }],
+        systemInstruction: { parts: [{ text: "be helpful" }] },
+        tools: [{ functionDeclarations: [{ name: "search" }] }],
+        generationConfig: { temperature: 0.5 },
+    };
+    const bdG = estimateRawBodyBreakdown(google, "google");
+    assert.equal(bdG.messages, t("user") + t("hello google"));
+    assert.equal(bdG.system, t("be helpful"));
+    assert.equal(bdG.tools, t("search"));
+    assert.equal(bdG.other, t("deepseek-flash"));
+    assert.equal(bdG.total, estimateRawBodyTokens(google));
+
+    // Explicit openai protocol matches the legacy default bucketing.
+    const openai = {
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: "hello openai" }],
+        system: "be helpful",
+        tools: [{ type: "function", name: "search" }],
+        metadata: { note: "structural note" },
+    };
+    assert.deepEqual(estimateRawBodyBreakdown(openai, "openai"), estimateRawBodyBreakdown(openai));
+});
+
+test("raw-body breakdown: a giant model-invisible field lands in other while the billable subtotal fits (#6828)", () => {
+    // Incident shape: messages ~126K, tools ~76K, system ~10K, other ~1.6M
+    // — the raw total reads ~1.8M against a 1M window while the billable
+    // content is ~213K. The fuse must judge the subtotal, not the total.
+    const body = {
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: "数".repeat(126_000) }],
+        tools: [{ type: "function", function: { name: "f", description: "d".repeat(305_900) } }],
+        system: "中".repeat(10_600),
+        metadata: { snapshot: "a".repeat(1_602_302 * 4) },
+    };
+    const bd = estimateRawBodyBreakdown(body, "openai");
+    assert.ok(bd.messages > 125_000 && bd.messages < 127_000, `messages bucket holds the conversation (got ${bd.messages})`);
+    assert.ok(bd.tools > 76_000 && bd.tools < 77_000, `tools bucket holds the schemas (got ${bd.tools})`);
+    assert.ok(bd.system > 10_000 && bd.system < 11_000, `system bucket holds the prompt (got ${bd.system})`);
+    assert.ok(bd.other > 1_600_000, `other holds the invisible snapshot (got ${bd.other})`);
+    const visible = bd.messages + bd.tools + bd.system;
+    assert.ok(visible < 1_000_000, `billable subtotal fits the floored fuse bar (got ${visible})`);
+    assert.ok(bd.total > 1_000_000, `raw total still exceeds it (got ${bd.total})`);
+    assert.equal(bd.total, bd.messages + bd.tools + bd.system + bd.other);
+    assert.equal(bd.total, estimateRawBodyTokens(body));
+});
