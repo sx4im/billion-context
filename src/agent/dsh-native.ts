@@ -1589,7 +1589,11 @@ const bodyParseMemo = new WeakMap<object, BodyParseRecord>();
 let bodyParseRealCount = 0;
 
 function inboundBytesOf(raw: unknown): number {
-    if (typeof raw === "string") return raw.length;
+    // #6908: a string body must be measured in UTF-8 bytes, like the ingest
+    // cap's decoded.body.byteLength — raw.length counts UTF-16 code units and
+    // understated the inbound size by 8%+ on the field session (31.06M logged
+    // vs 33.55M refused), hiding that the body was at the wall.
+    if (typeof raw === "string") return Buffer.byteLength(raw, "utf8");
     if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) return raw.byteLength;
     return 0;
 }
@@ -1635,6 +1639,7 @@ function emitHostParseDiagnostic(init: RequestInit | undefined): void {
 export function _resetBodyParseStatsForTest(): void { bodyParseRealCount = 0; }
 export function _bodyParseStatsForTest(): number { return bodyParseRealCount; }
 export function _parsedBodyOnceForTest(init: RequestInit | undefined): Promise<unknown> { return parsedBodyOnce(init); }
+export function _inboundBytesOfForTest(raw: unknown): number { return inboundBytesOf(raw); }
 
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     const child = forkChildVerdict(ctx);

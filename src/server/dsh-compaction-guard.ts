@@ -142,6 +142,35 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
  * length. */
 export const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
 
+/** #6908: over-band compaction-call recognition for the ingest cost band.
+ *
+ * The ingest band (#5794) refuses decoded bodies above
+ * network.ingestBodyBytes BEFORE the JSON.parse sweep — but a dsh compaction
+ * call IS a full-history inbound body, so once a session's inbound passes the
+ * band every round 413s before the request ever reaches isDshCompactionCall
+ * and the session self-locks (the only action that could shrink the host
+ * history never gets identified). A compaction call is never forwarded to a
+ * model — the #1729 guard answers/refuses it locally — so the band's
+ * "beyond every model window" rationale does not apply to it.
+ *
+ * Cheap prefilter first (#2709): the 48-byte marker sniff, so ordinary
+ * traffic never pays the JSON.parse below. A hit still goes through the full
+ * marker-decisive check, so a conversation that merely QUOTES the
+ * instruction string mid-history does not false-positive (the real check
+ * requires the final user message to START with the prefix). Fail-closed:
+ * unparseable bodies are not compaction calls and keep the cap. */
+export function isOverCapDshCompactionCall(protocol: string | null, rawBody: Buffer): boolean {
+    if (protocol === null) return false;
+    if (!rawBody.includes(DSH_COMPACTION_MARKER_SNIFF)) return false;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+        return false;
+    }
+    return isDshCompactionCall(protocol, parsed);
+}
+
 /** #2709 process-level count of passthrough-lane refusals (no session exists
  * on that lane, so the per-session #2490 ledger cannot record them). Exported
  * mutable record for tests and future stats surfacing. */

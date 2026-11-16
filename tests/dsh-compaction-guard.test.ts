@@ -5,6 +5,7 @@ import {
     DSH_COMPACTION_SHAPE_MSGS,
     dshCompactionRefusal,
     isDshCompactionCall,
+    isOverCapDshCompactionCall,
 } from "../src/server/dsh-compaction-guard.ts";
 
 // #1729/#2193: the guard must recognize dsh-compaction-basic's summarize
@@ -214,4 +215,48 @@ test("refusal status is neither auth-class nor transient-class on any lane", () 
 
 test("the versioned marker prefix matches the live dsh template", () => {
     assert.ok(INSTRUCTION.startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX));
+});
+
+// #6908: over-band recognition for the ingest cost band — sniff prefilter +
+// full marker-decisive verification, so ONLY a real compaction call (final
+// user message starts with the prefix) skips the cap. A body that merely
+// quotes the instruction must keep the cap, and unparseable bodies fail
+// closed.
+const rawOf = (body: unknown) => Buffer.from(JSON.stringify(body), "utf8");
+
+test("#6908: raw over-band-shaped compaction body IS recognised", () => {
+    const body = openaiBody([
+        { role: "system", content: "you are dsh" },
+        { role: "user", content: giantPrefix },
+        { role: "user", content: INSTRUCTION },
+    ]);
+    assert.equal(isOverCapDshCompactionCall("openai", rawOf(body)), true);
+});
+
+test("#6908: responses-wire compaction body IS recognised", () => {
+    const body = responsesBody([
+        { type: "message", role: "system", content: "you are dsh" },
+        { type: "message", role: "user", content: giantPrefix },
+        { type: "message", role: "user", content: INSTRUCTION },
+    ]);
+    assert.equal(isOverCapDshCompactionCall("responses", rawOf(body)), true);
+});
+
+test("#6908: quoting the instruction mid-history is NOT recognised", () => {
+    const msgs = Array.from({ length: 107 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `msg ${i}` }));
+    msgs[50] = { role: "user", content: INSTRUCTION };
+    msgs.push({ role: "user", content: "what did we just discuss?" });
+    assert.equal(isOverCapDshCompactionCall("openai", rawOf(openaiBody(msgs))), false);
+});
+
+test("#6908: unparseable body containing the marker fails closed", () => {
+    const raw = Buffer.from(`{"messages": [{"role": "user", "content": "${INSTRUCTION.slice(0, 48)}`, "utf8");
+    assert.equal(isOverCapDshCompactionCall("openai", raw), false);
+});
+
+test("#6908: bodies without the marker and out-of-scope protocols never match", () => {
+    const body = openaiBody([{ role: "user", content: "please continue the refactor" }]);
+    assert.equal(isOverCapDshCompactionCall("openai", rawOf(body)), false);
+    assert.equal(isOverCapDshCompactionCall(null, rawOf(openaiBody([{ role: "user", content: INSTRUCTION }]))), false);
+    assert.equal(isOverCapDshCompactionCall("google", rawOf(openaiBody([{ role: "user", content: INSTRUCTION }]))), false);
 });

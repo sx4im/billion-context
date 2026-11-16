@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, _inboundBytesOfForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
@@ -3401,6 +3401,20 @@ test("#5792: shared body-parse memo dedupes consumers and invalidates on body sw
     assert.equal(await _parsedBodyOnceForTest(bad), undefined, "unparseable body -> undefined");
     assert.equal(await _parsedBodyOnceForTest(bad), undefined, "failure cached, still undefined");
     assert.equal(_bodyParseStatsForTest(), 3, "each distinct init parses once");
+});
+
+// #6908: the host-json-parse diagnostic must report UTF-8 BYTES, like the
+// ingest cap's decoded.body.byteLength — raw.length counts UTF-16 code units
+// and understated the field session's inbound by 8%+ (31.06M logged vs
+// 33.55M refused), hiding that the body was at the wall.
+test("#6908: inbound size of a string body is its UTF-8 byte length, not its UTF-16 length", () => {
+    // "é" is 1 UTF-16 code unit but 2 UTF-8 bytes; CJK is 1 vs 3.
+    assert.equal(_inboundBytesOfForTest("é".repeat(100)), 200);
+    assert.equal(_inboundBytesOfForTest("你".repeat(100)), 300);
+    assert.equal(_inboundBytesOfForTest("x".repeat(100)), 100);
+    assert.equal(_inboundBytesOfForTest(Buffer.from("é".repeat(100), "utf8")), 200);
+    assert.equal(_inboundBytesOfForTest(new Uint8Array(7)), 7);
+    assert.equal(_inboundBytesOfForTest(undefined), 0);
 });
 
 // #5792: end-to-end through the real pre-send chain. An OpenAI-wire session used
