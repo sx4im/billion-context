@@ -341,7 +341,7 @@ interface Resident {
     close: () => Promise<void>;
 }
 
-function startResident(version: string, exitOnShutdown: boolean): Promise<Resident> {
+function startResident(version: string, exitOnShutdown: boolean, commit?: string): Promise<Resident> {
     let shutdowns = 0;
     let down = false;
     const server = http.createServer((req, res) => {
@@ -355,7 +355,7 @@ function startResident(version: string, exitOnShutdown: boolean): Promise<Reside
         if (req.url === "/__bili/plugin/manifest") {
             if (down && exitOnShutdown) { res.writeHead(503); res.end(); return; }
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version }));
+            res.end(JSON.stringify(commit === undefined ? { version } : { version, commit }));
             return;
         }
         res.writeHead(404);
@@ -450,3 +450,67 @@ for (const [label, version] of [["equal", VERSION], ["newer", "999.0.0"], ["unpa
         }
     });
 }
+
+// #6899: fetchProxyVersion appends the build commit for display
+// ("0.1.214 (4d2382bd5)"), and that display string flows into the #3544
+// rotation decision. The comparison must see through the suffix: a
+// strictly-older resident reporting a suffixed version is still rotated.
+test("#6899 pinned attach: an older resident reporting a commit-suffixed version is rotated out", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-home-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-state-"));
+    const resident = await startResident("0.0.1", true, "4d2382bd5");
+    let spawnCalls = 0;
+    try {
+        _resetRoutedForTest();
+        _resetRegisterForTest(resident.origin);
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+            const landed = await verifyAttachAndRecover(resident.origin);
+            assert.equal(landed, "http://127.0.0.1:2", "rotated out: the spawned origin wins");
+            assert.equal(spawnCalls, 1, "spawn fallback ran exactly once");
+            assert.equal(resident.shutdowns, 1, "graceful shutdown requested exactly once");
+            assert.equal(_registerStateForTest().base, "http://127.0.0.1:2", "register re-based onto the fresh spawn");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "preset unfrozen");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        await resident.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#6899 pinned attach: an equal-version resident reporting a commit-suffixed version still attaches untouched", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-eq-home-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-6899pin-eq-state-"));
+    const resident = await startResident(VERSION, false, "4d2382bd5");
+    let spawnCalls = 0;
+    try {
+        _resetRoutedForTest();
+        _resetRegisterForTest(resident.origin);
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+            const landed = await verifyAttachAndRecover(resident.origin);
+            assert.equal(landed, resident.origin, "attaches as-is");
+            assert.equal(spawnCalls, 0, "no spawn for an equal-version resident");
+            assert.equal(resident.shutdowns, 0, "no shutdown requested");
+            assert.equal(_registerStateForTest().base, resident.origin, "register bound to the resident");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, resident.origin, "preset stays frozen");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        await resident.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});

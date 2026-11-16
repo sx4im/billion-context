@@ -21,6 +21,22 @@ test("isVersionNewer handles prerelease ordering (pre < release, numeric pre par
     assert.equal(isVersionNewer("0.1.47", "0.1.46-pr.999.1"), true);
 });
 
+test("isVersionNewer tolerates the fetchProxyVersion ` (commit)` suffix (#6899)", () => {
+    // fetchProxyVersion appends the build commit for display, and that string
+    // flows into the #3544 stale-proxy rotation decision, so the comparison
+    // must see through the suffix instead of failing closed.
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 (abc123)"), true);
+    assert.equal(isVersionNewer("0.1.215", "0.1.215 (4d2382bd5)"), false);
+    assert.equal(isVersionNewer("0.1.214", "0.1.215 (4d2382bd5)"), false);
+    assert.equal(isVersionNewer("0.1.215 (abc123)", "0.1.214"), true);
+    assert.equal(isVersionNewer("0.1.215", "0.1.214-pr.1 (abc123)"), true);
+    // Anything else malformed still fails closed (no rotation on garbage).
+    assert.equal(isVersionNewer("0.1.215", "garbage (abc123)"), false);
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 (foo bar)"), false);
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 ()"), false);
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 (abc123) (def456)"), false);
+});
+
 test("registryUrlFor follows the configured dist-tag channel", () => {
     assert.equal(registryUrlFor("billion-context", "dev"), "https://registry.npmjs.org/billion-context/dev");
     assert.equal(registryUrlFor("billion-context", "stable"), "https://registry.npmjs.org/billion-context/stable");

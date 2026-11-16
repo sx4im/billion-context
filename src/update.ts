@@ -559,7 +559,14 @@ export function isVersionNewer(latest: string, current: string): boolean {
 }
 
 function parseSemVer(version: string): { parts: number[]; pre: string[] } | undefined {
-    const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.+)?$/);
+    // #6899: fetchProxyVersion appends the build commit for display
+    // ("0.1.215 (4d2382bd5)"), and that display string flows into
+    // isVersionNewer at the dsh-native attach decision — the regex below
+    // would reject it, so the stale-proxy rotation never fired. Strip one
+    // trailing " (commit)" suffix before matching; anything else malformed
+    // stays unparseable and fails closed (isVersionNewer returns false).
+    const clean = version.replace(/ \([0-9A-Za-z][0-9A-Za-z.-]*\)$/, "");
+    const match = clean.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.+)?$/);
     if (!match) return undefined;
     return {
         parts: [Number(match[1]), Number(match[2]), Number(match[3])],
