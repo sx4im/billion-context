@@ -32,6 +32,17 @@
  * URLs are therefore classified as NON-recoverable (the message keeps
  * pinning). Deliberately over-eager: a false positive only re-pins one media
  * message; a false negative silently loses the payload.
+ *
+ * #6875: DSH attachment images — a `type:"image"` part whose `attachment`
+ *  object carries a blob key (`attachmentId`, legacy spelling `id`) into
+ *  the DSH attachment library, a local content-addressed store (the
+ *  reporter verified all 504 blobs present, missing=0). The id is durable
+ *  by the litmus above (a bare id like a DeepSeek `file_id` — no expiry,
+ *  unlike a pre-signed URL), so it counts as a re-access handle and the
+ *  message folds, its id riding the stored summary. Parts without any id
+ *  keep pinning. Already-BLOCKED history needs no separate migration: the
+ *  #2607 BLOCKED→numeric migration in assignRefs fires on the next pass
+ *  once this classifier stops protecting the message.
  */
 import type { CompressionBlock, CoreMessage } from "./types.js";
 
@@ -88,6 +99,21 @@ export function looksEphemeralSignedUrl(ref: string): boolean {
   return false;
 }
 
+/** #6875: the re-access handle of a DSH attachment image part, if it
+ *  carries one — `attachmentId` first (live shape, DSH 0.2.2-rc.3), then the
+ *  legacy `id` spelling (the #3398 stand-in). Only `type:"image"` parts
+ *  qualify; anything else is not DSH media. */
+function dshAttachmentRef(part: Record<string, unknown>): string | undefined {
+  if (part.type !== "image") return undefined;
+  const attachment = asObj(part.attachment);
+  if (!attachment) return undefined;
+  for (const key of ["attachmentId", "id"] as const) {
+    const v = attachment[key];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return undefined;
+}
+
 function pushRef(refs: string[], ref: unknown): void {
   if (typeof ref !== "string" || ref.length === 0 || isInlineDataUrl(ref)) return;
   // #5865-P2: an expiring handle is not a re-access handle — keep the
@@ -97,7 +123,8 @@ function pushRef(refs: string[], ref: unknown): void {
   refs.push(ref);
 }
 
-/** Collect every re-access handle (non-data: URL / file id / fileUri) a
+/** Collect every re-access handle (non-data: URL / file id / fileUri /
+ *  DSH attachment id) a
  *  message exposes across all five wire sidecar families, in stable
  *  sidecar-then-part order, deduplicated. Empty array = no extractable
  *  handle (the message's media, if any, is byteless-and-refless). */
@@ -111,7 +138,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
     else if (roc.type === "file") {
       pushRef(refs, roc.file_id);
       pushRef(refs, roc.url);
-    }
+    } else if (roc.type === "image") pushRef(refs, dshAttachmentRef(roc));
   }
   if (Array.isArray(m.rawOpenaiContentParts)) {
     for (const p of m.rawOpenaiContentParts) {
@@ -121,7 +148,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
       else if (part.type === "file") {
         pushRef(refs, part.file_id);
         pushRef(refs, part.url);
-      }
+      } else if (part.type === "image") pushRef(refs, dshAttachmentRef(part));
     }
   }
 

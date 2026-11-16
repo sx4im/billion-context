@@ -326,6 +326,23 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           { toolName: m.name || toolNames.get(m.tool_call_id ?? "") },
         );
         const name = m.name || toolNames.get(m.tool_call_id ?? "");
+        // #6875: a tool result's image parts (DSH read_image
+        // `{type:"image", attachment:{attachmentId,...}}`) ride the plural
+        // sidecar so the classifier can see them — without it the part is
+        // dropped here and the message can never be judged recoverable.
+        // Only image parts are retained; other non-text parts keep today's
+        // drop behavior. The rebuild still emits text-only (coreToOpenai's
+        // role "tool" branch ignores the sidecar), so the wire echo is
+        // byte-identical; the sidecar exists for classification and the
+        // fold's MEDIA REFS section only.
+        const imageParts = Array.isArray(m.content)
+          ? m.content.filter(
+              (part) =>
+                typeof part === "object" &&
+                part !== null &&
+                (part as { type?: unknown }).type === "image",
+            )
+          : [];
         msgs.push({
           id: clusters.next(base),
           role: "tool",
@@ -333,6 +350,9 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           toolCallId: m.tool_call_id ?? "",
           text: stringContent(m.content),
           ...(name ? { toolName: name } : {}),
+          ...(imageParts.length > 0
+            ? { rawOpenaiContentParts: imageParts }
+            : {}),
         });
         break;
       }
