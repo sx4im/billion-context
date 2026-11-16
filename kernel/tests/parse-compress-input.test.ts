@@ -90,6 +90,56 @@ test("parseCompressArgs salvages a stringified content array truncated mid-entry
   assert.equal(diagnostics.invalidItems, 0);
 });
 
+test("parseCompressArgs reports truncated-input when a stringified content array is cut mid-first-entry (#6946)", () => {
+  const full = JSON.stringify([
+    {
+      startRef: "m00001",
+      endRef: "m00002",
+      summary: "first entry summary text that is long enough to be cut mid-sentence",
+    },
+  ]);
+  const input = { content: full.slice(0, full.length - 12) };
+  const { ranges, diagnostics } = parseCompressArgs(input);
+  assert.equal(diagnostics.kind, "truncated-input");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.invalidItems, 0);
+  assert.deepEqual(diagnostics.invalidReasons, [
+    "content appears truncated mid-document; re-issue the call, line form is the most robust",
+  ]);
+});
+
+test("parseCompressArgs reports truncated-input when a stringified content array is cut after a complete string value (#6946)", () => {
+  const full = JSON.stringify([
+    { startRef: "m00001", endRef: "m00002", summary: "x" },
+  ]);
+  const input = { content: full.slice(0, full.length - 3) };
+  const { ranges, diagnostics } = parseCompressArgs(input);
+  assert.equal(diagnostics.kind, "truncated-input");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+});
+
+test("parseCompressArgs keeps content-not-array for a balanced-but-invalid content array string (#6946)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: '[{"startRef": }]',
+  });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+});
+
+test("parseCompressArgs keeps content-not-array for mid-string garbage in an unclosed array (#6946)", () => {
+  // Unbalanced shape, but the strict-parse error sits mid-string (a garbage
+  // token), not at the end: this is malformed input, not a wire truncation.
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: '[{"startRef": "m00001", "summary": "x", garbage',
+  });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.ok, false);
+  assert.equal(ranges.length, 0);
+});
+
 test("parseCompressArgs strips markdown fences (with and without language tag)", () => {
   const doc = JSON.stringify({
     content: [{ startRef: "m00001", endRef: "m00002", summary: "fenced" }],

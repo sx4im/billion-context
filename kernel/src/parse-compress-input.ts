@@ -21,7 +21,9 @@
 //
 // Salvage semantics: for truncated input, the complete entries of the
 // `content` array are recovered from the surviving prefix. A partially
-// written entry is dropped, never guessed. Diagnostics are data, not logs:
+// written entry is dropped, never guessed. When no complete entry survives,
+// the diagnostic kind is `truncated-input` instead of the misleading
+// `content-not-array` (billion-context#6946). Diagnostics are data, not logs:
 // adapters decide where to emit them (log line, debug event, tool text).
 
 import { clampPrefix } from "./truncate.js";
@@ -35,6 +37,7 @@ export type CompressParseKind =
   | "content-not-array"
   | "malformed-json"
   | "truncated"
+  | "truncated-input"
   | "no-valid-ranges";
 
 export interface CompressParseDiagnostics {
@@ -202,6 +205,18 @@ function parseObjectValue(
       parsed === null ||
       (parsed.entries.length === 0 && content.trim().length > 0)
     ) {
+      // #6946: a JSON-array document cut off on the wire (no complete entry
+      // survives) is truncation, not a wrong shape — the line-form ladder
+      // below would misreport it as content-not-array. Name the real
+      // condition so the operator re-issues the call instead of debugging
+      // the shape.
+      if (isTruncatedJsonArrayDocument(content)) {
+        diag.kind = "truncated-input";
+        diag.invalidReasons = [
+          "content appears truncated mid-document; re-issue the call, line form is the most robust",
+        ];
+        return finish([], diag);
+      }
       // Not a JSON array (or nothing salvageable): bare line-form text.
       // Strip JSON-wrapper residue (stringified ["…"] with broken
       // escaping) — the line form needs structure only in the refs
@@ -948,6 +963,37 @@ function repairAtParserPositions(s: string): string {
     }
   }
   return cur;
+}
+
+// #6946: a `content` STRING that is a JSON-array document cut off on the
+// wire. The truncation signature: the string opens a JSON array, the lenient
+// parse fails, and the strict parser's error sits at (or one char before)
+// the end of the string — the parser consumed a clean prefix and ran out of
+// input. `looksTruncated` additionally requires the shape to be
+// unbalanced/unterminated, so balanced garbage (whose error sits mid-string)
+// does not qualify.
+function isTruncatedJsonArrayDocument(content: string): boolean {
+  const cleaned = stripFence(content.trim());
+  if (!cleaned.startsWith("[")) return false;
+  if (tryParseLenient(cleaned) !== undefined) return false;
+  if (!looksTruncated(cleaned)) return false;
+  return parseFailsAtEnd(cleaned);
+}
+
+// Strict-parse error position at (or one char before) the end of input: the
+// parser consumed a valid prefix and wanted more input. "Unexpected end of
+// JSON input" carries no position and means the same thing.
+function parseFailsAtEnd(s: string): boolean {
+  try {
+    JSON.parse(s);
+    return false;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    if (message.includes("Unexpected end of JSON input")) return true;
+    const at = /at position (\d+)/.exec(message);
+    if (at === null) return false;
+    return Number(at[1]) >= s.length - 1;
+  }
 }
 
 // Unbalanced brackets or an unterminated string at end of input is the
