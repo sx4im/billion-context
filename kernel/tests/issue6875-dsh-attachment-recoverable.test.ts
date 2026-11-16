@@ -54,7 +54,11 @@ function sidecarMsg(id: string, extra: object): CoreMessage {
   );
 }
 
-function textMsg(id: string, role: CoreMessage["role"], text: string): CoreMessage {
+function textMsg(
+  id: string,
+  role: CoreMessage["role"],
+  text: string,
+): CoreMessage {
   return { id, role, contentType: "text", text };
 }
 
@@ -181,12 +185,23 @@ test("applyCompression records the DSH attachmentId in the block summary (#6875,
   }).map;
 
   const result = core.applyCompression({
-    ranges: [{ startRef: "m00001", endRef: "m00003", summary: "folded work", topic: "t" }],
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00003",
+        summary: "folded work",
+        topic: "t",
+      },
+    ],
     messages,
     state,
     config: config(),
   });
-  assert.equal(result.result.errors.length, 0, JSON.stringify(result.result.errors));
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
   const block = result.state.blocks[0]!;
   assert.ok(block.summary.includes(MEDIA_REFS_MARKER));
   assert.ok(block.summary.includes(`- ${ATTACHMENT_ID}`));
@@ -196,10 +211,9 @@ test("collectFoldMediaRefs carries the DSH handle forward from consumed blocks (
   const carriedBlock = {
     summary: `old\n\n${MEDIA_REFS_MARKER}\n- ${ATTACHMENT_ID}`,
   };
-  assert.deepEqual(
-    collectFoldMediaRefs([], [carriedBlock as never]),
-    [ATTACHMENT_ID],
-  );
+  assert.deepEqual(collectFoldMediaRefs([], [carriedBlock as never]), [
+    ATTACHMENT_ID,
+  ]);
 });
 
 // --- Codec half (#6875 ①, maintainer triage 2026-11-16): the tool
@@ -228,7 +242,8 @@ test("openaiToCore retains a tool result's DSH image part on the plural sidecar 
   assert.equal(core.text, DSH_TOOL_JOINED_TEXT);
   assert.equal(core.toolCallId, "call_read_image_1");
   assert.deepEqual(
-    (core as unknown as { rawOpenaiContentParts?: unknown }).rawOpenaiContentParts,
+    (core as unknown as { rawOpenaiContentParts?: unknown })
+      .rawOpenaiContentParts,
     [DSH_PART],
   );
   // And the classifier now sees it: recoverable, foldable.
@@ -244,7 +259,11 @@ test("coreToOpenai rebuilds a sidecarred tool result as text-only, byte-identica
   // as the pre-fix codec did for this message (the trailing newline is
   // stringContent's pre-existing join of [text, image], not this change).
   assert.deepEqual(withImage, [
-    { role: "tool", tool_call_id: "call_read_image_1", content: DSH_TOOL_JOINED_TEXT },
+    {
+      role: "tool",
+      tool_call_id: "call_read_image_1",
+      content: DSH_TOOL_JOINED_TEXT,
+    },
   ]);
 });
 
@@ -273,7 +292,10 @@ test("a non-image non-text part in a tool result is still dropped (#6875 ①)", 
         role: "tool",
         tool_call_id: "call_1",
         name: "read_image",
-        content: [{ type: "text", text: "done" }, { type: "mystery", blob: "zzz" }],
+        content: [
+          { type: "text", text: "done" },
+          { type: "mystery", blob: "zzz" },
+        ],
       },
     ],
   } as never);
