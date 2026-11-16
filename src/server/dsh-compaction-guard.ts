@@ -191,6 +191,28 @@ export async function detectPassthroughDshCompactionCall(
     return isDshCompactionCall(protocol, parsed);
 }
 
+/** #6908: the ingest gate refuses over-cap bodies BEFORE JSON.parse, which
+ * self-locks a session whose ONLY way to shrink (a dsh compaction call) is
+ * itself a full-history inbound body. A compaction call must reach the #1729
+ * guard instead of 413ing at ingest. Cheap prefilter first — the same 48-byte
+ * marker sniff on the raw decoded bytes as the passthrough detector above —
+ * so ordinary over-cap traffic never pays a parse; a sniff hit goes through
+ * the full marker-decisive check, and anything unparseable or not-a-compaction-call
+ * returns false (fail-closed: the 413 stands). Runs on the DECODED body (the
+ * ingest gate already decoded it), so a declared content-encoding hides
+ * nothing from the sniff. */
+export function isDshCompactionCallInRawBody(protocol: string | null, raw: Buffer): boolean {
+    if (protocol === null) return false;
+    if (!raw.includes(DSH_COMPACTION_MARKER_SNIFF)) return false;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw.toString("utf8"));
+    } catch {
+        return false;
+    }
+    return isDshCompactionCall(protocol, parsed);
+}
+
 // #2432: dsh compaction-basic's CHECKPOINT FRAMING — the single replacement
 // user message a LANDED compaction writes into the client's history
 // (CHECKPOINT_PREAMBLE + SUMMARY_OPEN_TAG … SUMMARY_CLOSE_TAG,

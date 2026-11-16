@@ -1584,7 +1584,10 @@ const bodyParseMemo = new WeakMap<object, BodyParseRecord>();
 let bodyParseRealCount = 0;
 
 function inboundBytesOf(raw: unknown): number {
-    if (typeof raw === "string") return raw.length;
+    // #6908: strings are UTF-8 bytes on the wire — raw.length counts UTF-16
+    // code units, which understated the field session's inbound by 8%+ and
+    // hid how close it was to the ingest cap (the cap compares byteLength).
+    if (typeof raw === "string") return Buffer.byteLength(raw, "utf8");
     if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) return raw.byteLength;
     return 0;
 }

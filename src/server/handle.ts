@@ -71,7 +71,7 @@ import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, 
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall, isDshCompactionCallInRawBody } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -524,8 +524,17 @@ async function handleRequest(
                 // pre-send byte budget. The probe is a cheap substring gate,
                 // so the text-dump rejection (#5794's shape) stays parse-free.
                 const ingestCap = protocol === "responses" ? 0 : knobLimitsIngestBytes();
+                // #6908: an over-cap body that IS a dsh compaction call must
+                // reach the #1729 guard (which answers/refuses it) instead of
+                // 413ing here — the compaction call is the session's only way
+                // to shrink, and it is itself a full-history inbound body, so
+                // refusing it here self-locks the session forever. The check
+                // is sniff-gated (48-byte marker on the raw decoded bytes)
+                // and fail-closed, so ordinary over-cap traffic still 413s
+                // without paying a parse; the cap default is untouched.
                 if (ingestCap > 0 && decoded.body.byteLength > ingestCap
-                    && countImagesInRawBody(protocol, decoded.body) === 0) {
+                    && countImagesInRawBody(protocol, decoded.body) === 0
+                    && !isDshCompactionCallInRawBody(protocol, decoded.body)) {
                     throw new IngestBodyTooLargeError(ingestCap, decoded.body.byteLength);
                 }
                 bodyBuffer = decoded.body;
@@ -550,7 +559,7 @@ async function handleRequest(
             return;
         }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError || err instanceof IngestBodyTooLargeError) {
-            log("warn", `413: request body exceeds ${err.limit} bytes`);
+            log("warn", `413: request body exceeds ${err.limit} bytes${err instanceof IngestBodyTooLargeError ? ` (inbound ${err.bytes} B)` : ""}`);
             res.writeHead(413, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof IngestBodyTooLargeError ? "ingest" : err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
             return;
