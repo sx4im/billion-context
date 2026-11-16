@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExternalSummaryExecutor, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
+import { describeExternalSummaryFailure, ExternalSummaryExecutor, externalSummaryFailureAdvice, type ExternalSummaryBatchResult, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
 
 const work: SummaryWork = { content: "Historical task evidence", instructions: "Preserve constraints and unfinished work", reference: "Read-only current task" };
 const budget: SummaryBudget = { totalTimeoutMs: 2000, targetTimeoutMs: 500, maxSummaryBytes: 200 };
@@ -239,4 +239,69 @@ test("external summary: queued time does not spend the per-target dispatch budge
     assert.equal((await holder).status, "cancelled");
     leave.resolve("holder");
     assert.equal((await queued).status, "success");
+});
+
+// #6885: a candidate rejection keeps its cause as a fixed label — never the
+// raw message, so provider internals (keys, URLs, payload) cannot leak into
+// the attempts list the way the "without leaking provider errors" test pins.
+test("external summary: classified candidate rejections keep their cause", async () => {
+    const executor = new ExternalSummaryExecutor(1);
+    const guard = await executor.execute(work, [{ summarize: async () => { throw new Error("External summary input exceeds the target context budget"); } }], budget);
+    assert.equal(guard.status, "failed");
+    assert.deepEqual(guard.attempts, [{ targetIndex: 0, outcome: "error", detail: "input exceeds target context budget" }]);
+    const parse = await executor.execute(work, [{ summarize: async () => { throw new Error("External summary response contains no summary"); } }], budget);
+    assert.deepEqual(parse.attempts, [{ targetIndex: 0, outcome: "error", detail: "no summary in response" }]);
+});
+
+test("external summary: unclassified candidate rejections stay bare", async () => {
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("private-key private-url source-content"); } }], budget);
+    assert.equal(result.status, "failed");
+    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+    assert.equal(JSON.stringify(result).includes("private"), false);
+});
+
+// #6885: the reported chain shape — serial 25s/50s-style budgets where the
+// third candidate never gets a request out. The batch must record every
+// candidate: the two timeouts plus the starved tail, not a silent omission.
+test("external summary: a chain that outruns its total budget records the starved tail", async () => {
+    // Cooperative like a real fetch: the in-flight call settles (rejects) on
+    // abort, so the pool permit frees and the next candidate can start — a
+    // non-cooperative call would hold the permit past the deadline instead
+    // (see "late non-cooperative results cannot succeed or exceed capacity").
+    const slow: SummaryCandidate = { summarize: (_request, signal) => new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        setTimeout(() => _resolve("too slow"), 1000);
+    }) };
+    // Budgets are deliberately shaped so the outcome is load-independent:
+    // t0 gets its full 200ms target (300ms total leaves a 100ms margin, far
+    // above the ~40ms timer slippage this box shows under parallel load), t1
+    // times out either way, and t2's iteration can only begin at or after
+    // the 300ms deadline — so it is skipped, never raced with its own timer.
+    // (A 50/60ms shape flaked: a 50ms timer slipping ~40ms under load let t1
+    // start after the deadline, and a 50/120ms shape let t2's own timer win.)
+    const batch = await new ExternalSummaryExecutor(1).executeBatch([work], [slow, slow, slow], { totalTimeoutMs: 300, targetTimeoutMs: 200, maxSummaryBytes: 200 });
+    assert.equal(batch.status, "deadline");
+    const result = batch.results[0];
+    assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "timeout", "skipped"]);
+    assert.match(result.attempts[0].detail ?? "", /^target-timeout 200ms \(elapsed \d+ms\)$/);
+    assert.deepEqual(result.attempts[2], { targetIndex: 2, outcome: "skipped", detail: "total budget exhausted before dispatch" });
+    assert.ok(describeExternalSummaryFailure(batch).includes("t2:skipped (total budget exhausted before dispatch)"));
+});
+
+// #6885: the compress receipt must name the real cause — the cap knob only
+// when a summary was actually rejected for length, the budget when time ran
+// out, the attempt detail when candidates errored.
+test("external summary: failure advice names the real cause", () => {
+    const invalidSummary: ExternalSummaryBatchResult = { status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "invalid_summary", detail: "response 70000 bytes exceeds byte cap 65536" }] }] };
+    assert.equal(externalSummaryFailureAdvice(invalidSummary), "summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.");
+    const deadline: ExternalSummaryBatchResult = { status: "deadline", results: [{ status: "deadline", attempts: [
+        { targetIndex: 0, outcome: "timeout", detail: "target-timeout 25000ms (elapsed 25015ms)" },
+        { targetIndex: 1, outcome: "timeout", detail: "batch-deadline 50000ms (elapsed 50005ms)" },
+        { targetIndex: 2, outcome: "skipped", detail: "total budget exhausted before dispatch" },
+    ] }] };
+    assert.equal(externalSummaryFailureAdvice(deadline), "the configured time budget ran out before any candidate could finish, so raise the external-summary budget (budget.totalTimeoutMs / budget.targetTimeoutMs) or put a faster target first.");
+    const errored: ExternalSummaryBatchResult = { status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "input exceeds target context budget" }] }] };
+    assert.equal(externalSummaryFailureAdvice(errored), "the candidates errored before producing a summary — see the per-candidate detail in the attempts list and fix the reported cause.");
+    const invalidPlan: ExternalSummaryBatchResult = { status: "failed", reason: "invalid_plan", results: [] };
+    assert.equal(externalSummaryFailureAdvice(invalidPlan), "summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.");
 });

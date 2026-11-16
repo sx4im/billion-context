@@ -44,9 +44,32 @@ export function summaryAbortSource(signal: AbortSignal): SummaryAbortSource | un
 /** #4833: human-readable WHY for a timed-out attempt — the source, the budget
  *  it hit, and how much wall-clock the range had burned. Pure numbers and fixed
  *  words; never echoes payload. */
-function timeoutDetail(source: SummaryAbortSource, limits: SummaryBudget, elapsedMs: number): string {
-    const budgetMs = source === "target-timeout" ? limits.targetTimeoutMs : limits.totalTimeoutMs;
+function timeoutDetail(source: SummaryAbortSource, budgetMs: number, elapsedMs: number): string {
     return `${source} ${budgetMs}ms (elapsed ${Math.round(elapsedMs)}ms)`;
+}
+
+/** [#6885] Classify a candidate rejection into a fixed, safe label — the
+ *  executor used to drop every rejection reason (`() => ({ kind: "error" })`),
+ *  so a synchronously-thrown guard (context budget) or a parse failure after
+ *  a successful fetch left only a bare `error` in `attempts` and zero warn
+ *  lines: undiagnosable from the log without reading the bundle. The label
+ *  must NEVER echo the raw message: rejections can carry provider internals
+ *  (keys, URLs, payload — see the "without leaking provider errors" test),
+ *  so only these exact project-owned fixed strings map to a label and
+ *  everything else stays a bare `error`. */
+const KNOWN_SUMMARY_ERROR_DETAILS: Readonly<Record<string, string>> = {
+    "External summary input exceeds the target context budget": "input exceeds target context budget",
+    "External summary response is empty": "empty response",
+    "External summary response exceeds its byte budget": "response exceeds byte budget",
+    "External summary response did not complete": "incomplete response",
+    "External summary response contains an invalid frame": "invalid response frame",
+    "External summary response contains no summary": "no summary in response",
+    "Summary attempt cancelled before dispatch": "cancelled before dispatch",
+};
+
+export function summaryErrorDetail(error: unknown): string | undefined {
+    const message = error instanceof Error ? error.message : undefined;
+    return message === undefined ? undefined : KNOWN_SUMMARY_ERROR_DETAILS[message];
 }
 
 /** [#2657] Per-batch pool-size request for the shared queue. The pool grows
@@ -59,7 +82,7 @@ interface SummaryPoolOptions {
 
 interface SummaryAttempt {
     readonly targetIndex: number;
-    readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled";
+    readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled" | "skipped";
     /** #3635: WHY an invalid_summary reply was rejected wholesale — before, a
      *  discarded over-cap summary left only this bare outcome as a trace. */
     readonly detail?: string;
@@ -74,7 +97,7 @@ export type ExternalSummaryBatchResult =
     | { status: "finished" | "cancelled" | "deadline"; results: ExternalSummaryResult[] }
     | { status: "failed"; reason: "invalid_plan"; results: [] };
 
-type AttemptResult = { kind: "value"; value: string } | { kind: "error" } | { kind: "aborted" };
+type AttemptResult = { kind: "value"; value: string } | { kind: "error"; detail?: string } | { kind: "aborted" };
 type Release = () => void;
 interface Waiter {
     signal: AbortSignal;
@@ -126,6 +149,27 @@ export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult
     if (result.status === "failed") parts.push(`reason=${result.reason}`);
     parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}${a.detail ? ` (${a.detail})` : ""}`).join(",")}]`);
     return parts.join(" ");
+}
+
+/** [#6885] The advice clause of the compress failure receipt, branched by the
+ *  actual cause. The old text blamed `compress.maxSummaryLength` for EVERY
+ *  failure — timeouts, instant guard errors and parse failures alike — even
+ *  though the cap was never set and never the cause. The cap knob is named
+ *  only when a summary was actually rejected for length; a run-out budget
+ *  names the budget knobs; anything else points at the per-candidate detail.
+ *  MODEL-FACING TEXT: these strings ride the compress tool result, so they
+ *  name config knobs only — no numbers, refs or positions the model could
+ *  anchor on and propagate (see AGENTS.md §7.3). */
+export function externalSummaryFailureAdvice(batch: ExternalSummaryBatchResult): string {
+    const capAdvice = "summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.";
+    if (batch.status === "failed") return capAdvice;
+    const result = batch.results.find((entry) => entry.status !== "success") ?? batch.results[0];
+    if (!result) return capAdvice;
+    if (result.attempts.some((attempt) => attempt.outcome === "invalid_summary")) return capAdvice;
+    if (batch.status === "deadline" || result.status === "deadline" || result.attempts.some((attempt) => attempt.outcome === "timeout")) {
+        return "the configured time budget ran out before any candidate could finish, so raise the external-summary budget (budget.totalTimeoutMs / budget.targetTimeoutMs) or put a faster target first.";
+    }
+    return "the candidates errored before producing a summary — see the per-candidate detail in the attempts list and fix the reported cause.";
 }
 
 function validBudget(budget: SummaryBudget): boolean {
@@ -251,7 +295,21 @@ export class ExternalSummaryExecutor {
         if (signal?.aborted) cancel("cancelled");
         const deadline = Math.min(performance.now() + limits.totalTimeoutMs, sharedDeadline ?? Infinity);
         const totalTimer = setTimeout(() => cancel("batch-deadline"), Math.max(0, deadline - performance.now()));
-        const stopped = (): ExternalSummaryResult => ({ status: signal?.aborted ? "cancelled" : "deadline", attempts });
+        const stopped = (): ExternalSummaryResult => {
+            if (signal?.aborted) return { status: "cancelled", attempts };
+            // [#6885] A deadline exit after at least one attempt means the
+            // remaining candidates never got a request out — record them as
+            // skipped instead of silently dropping them, so the failure line
+            // names the starved tail. When NOTHING dispatched the list stays
+            // empty: preflight treats a deadline with zero attempts as pool
+            // congestion (#2657 × #2678), and that detection must keep working.
+            if (attempts.length > 0) {
+                for (let index = attempts.length; index < targets.length; index++) {
+                    attempts.push({ targetIndex: index, outcome: "skipped", detail: "total budget exhausted before dispatch" });
+                }
+            }
+            return { status: "deadline", attempts };
+        };
         try {
             for (const [targetIndex, target] of targets.entries()) {
                 const release = await this.acquire(overall.signal);
@@ -266,16 +324,22 @@ export class ExternalSummaryExecutor {
                 const propagateOverall = (): void => { attempt.abort(overall.signal.reason); };
                 overall.signal.addEventListener("abort", propagateOverall, { once: true });
                 if (overall.signal.aborted) propagateOverall();
-                const targetDeadline = performance.now() + limits.targetTimeoutMs;
+                // [#6885] The per-attempt timer must never outlive the batch:
+                // without the clamp an attempt started on the last seconds of
+                // the total budget carries the full target timeout, so a
+                // late-dispatching fetch is killed mid-flight as batch-deadline
+                // instead of failing fast on its own (shortened) target budget.
+                const attemptTimeoutMs = Math.min(limits.targetTimeoutMs, Math.max(0, deadline - performance.now()));
+                const targetDeadline = performance.now() + attemptTimeoutMs;
                 const expireTarget = (): void => { attempt.abort(new SummaryAbortError("target-timeout")); };
-                const timer = setTimeout(expireTarget, limits.targetTimeoutMs);
+                const timer = setTimeout(expireTarget, attemptTimeoutMs);
                 // Retain the permit until the actual call settles, even if it ignores cancellation.
                 const operation: Promise<AttemptResult> = Promise.resolve().then(() => {
                     if (performance.now() >= deadline) cancel("batch-deadline");
                     if (performance.now() >= targetDeadline) expireTarget();
                     if (attempt.signal.aborted) throw new Error("Summary attempt cancelled before dispatch");
                     return target.summarize(request, attempt.signal);
-                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), () => ({ kind: "error" })).finally(release);
+                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), (error) => ({ kind: "error", detail: summaryErrorDetail(error) })).finally(release);
                 let result: AttemptResult;
                 try {
                     result = await awaitAttempt(operation, attempt.signal);
@@ -286,14 +350,14 @@ export class ExternalSummaryExecutor {
                 if (performance.now() >= deadline) cancel("batch-deadline");
                 if (overall.signal.aborted) {
                     if (signal?.aborted) attempts.push({ targetIndex, outcome: "cancelled", detail: "caller abort" });
-                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", limits, performance.now() - startedAt) });
+                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", limits.totalTimeoutMs, performance.now() - startedAt) });
                     return stopped();
                 }
                 if (performance.now() >= targetDeadline) expireTarget();
                 if (result.kind === "aborted" || attempt.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", limits, performance.now() - startedAt) });
+                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", attemptTimeoutMs, performance.now() - startedAt) });
                 } else if (result.kind === "error") {
-                    attempts.push({ targetIndex, outcome: "error" });
+                    attempts.push({ targetIndex, outcome: "error", ...(result.detail !== undefined ? { detail: result.detail } : {}) });
                 } else if (typeof result.value !== "string" || !result.value.trim()
                     || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
                     || result.value.trim().length < (request.minSummaryChars ?? 1)

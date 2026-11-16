@@ -282,7 +282,9 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
         await upstream((_req, res) => res.end(JSON.stringify(body)), async (url) => {
             const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url, protocol), 4096)], budget);
             assert.equal(result.status, "failed");
-            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+            // #6885: the parse failure is classified, not swallowed — the
+            // attempt keeps its cause as a fixed label.
+            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "incomplete response" }]);
         });
     });
 }
@@ -295,6 +297,30 @@ for (const body of ["", "<html>Gateway error</html>", "data: {\"type\":\"respons
         });
     });
 }
+
+// #6885: the two silent failure sites get a warn like fetch failures do —
+// the context-budget guard (no request dispatched) and parse failures after
+// a successful fetch — and the attempt keeps the classified cause.
+test("external summary HTTP: context-budget guard warns and names its cause", async () => {
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    const candidate = createSummaryHttpCandidate({ ...target("http://127.0.0.1:1"), contextWindow: 200, outputTokens: 100 }, 4096);
+    const result = await new ExternalSummaryExecutor(1).execute(work, [candidate], budget);
+    assert.equal(result.status, "failed");
+    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "input exceeds target context budget" }]);
+    assert.ok(lines.some((line) => line.includes("input exceeds target context budget") && line.includes("no request dispatched")), `guard warn missing: ${lines.join("\n")}`);
+});
+
+test("external summary HTTP: incomplete response warns after the fetch", async () => {
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    await upstream((_req, res) => res.end(""), async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "failed");
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "incomplete response" }]);
+    });
+    assert.ok(lines.some((line) => line.includes("failed after response") && line.includes("incomplete response")), `parse warn missing: ${lines.join("\n")}`);
+});
 
 test("external summary HTTP: response byte cap and invalid UTF-8 fail closed", async () => {
     for (const response of [Buffer.from(JSON.stringify(completion("responses", "x".repeat(4096)))), Buffer.from([0xff])]) {

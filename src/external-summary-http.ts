@@ -1,5 +1,5 @@
 import type { SummaryBudget, SummaryCandidate, SummaryWork } from "./external-summary.js";
-import { summaryAbortSource } from "./external-summary.js";
+import { summaryAbortSource, summaryErrorDetail } from "./external-summary.js";
 import { defaultCountTokens } from "acp-kernel";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, type UpstreamFailureKind } from "./upstream-fail.js";
 import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.js";
@@ -231,7 +231,16 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             const inputTokens = defaultCountTokens(system) + defaultCountTokens(content);
             const payload = summaryPayload(plan.protocol, plan.model, system, content, plan.stream ?? false, true, url.hostname, plan.contextWindow);
             if (plan.outputTokens !== undefined) {
-                if (plan.contextWindow !== undefined && defaultCountTokens(system) + defaultCountTokens(content) + 256 + plan.outputTokens > plan.contextWindow) throw new Error("External summary input exceeds the target context budget");
+                // [#6885] This guard fires BEFORE any request is dispatched, so
+                // unlike fetch failures it never reached a warn line — batches
+                // died in 34–83ms with three bare `error` attempts and nothing
+                // in the log. Warn with numbers only, then throw the same
+                // fixed-string error the executor classifies (see
+                // summaryErrorDetail — never the raw message).
+                if (plan.contextWindow !== undefined && defaultCountTokens(system) + defaultCountTokens(content) + 256 + plan.outputTokens > plan.contextWindow) {
+                    loggerLog("warn", `[external-summary] candidate ${plan.model} input exceeds target context budget (input≈${inputTokens}tok, contextWindow=${plan.contextWindow}, outputTokens=${plan.outputTokens}) — no request dispatched`);
+                    throw new Error("External summary input exceeds the target context budget");
+                }
                 if (plan.protocol === "google") {
                     const generationConfig = payload.generationConfig as Record<string, unknown>;
                     generationConfig.maxOutputTokens = plan.outputTokens;
@@ -303,7 +312,20 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                         }
                         throw new Error(`External summary upstream rejected the request with HTTP ${dispatched.response.status}`);
                     }
-                    const result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
+                    // [#6885] Parse/read failures happen AFTER a successful
+                    // fetch, so they never reached the fetch-failure warn above
+                    // — the batch died with a bare `error` and no log line.
+                    // Warn with the classified label only (never the raw
+                    // message); the executor records the same label in the
+                    // attempt, so the log line and the failure line agree.
+                    let result: string;
+                    try {
+                        result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
+                    } catch (error) {
+                        const detail = summaryErrorDetail(error);
+                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} failed after response (${detail ?? "response could not be parsed"}; ${diagnostics()})`);
+                        throw error;
+                    }
                     signal.throwIfAborted();
                     return result;
                 } finally {
