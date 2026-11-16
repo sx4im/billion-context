@@ -1,3 +1,6 @@
+import { defaultCountTokens } from "acp-kernel";
+import { SUMMARY_DEFAULT_BUDGET } from "./external-summary-settings.js";
+
 export interface SummaryWork {
     readonly content: string;
     readonly instructions: string;
@@ -74,7 +77,7 @@ export type ExternalSummaryBatchResult =
     | { status: "finished" | "cancelled" | "deadline"; results: ExternalSummaryResult[] }
     | { status: "failed"; reason: "invalid_plan"; results: [] };
 
-type AttemptResult = { kind: "value"; value: string } | { kind: "error" } | { kind: "aborted" };
+type AttemptResult = { kind: "value"; value: string } | { kind: "error"; detail: string } | { kind: "aborted" };
 type Release = () => void;
 interface Waiter {
     signal: AbortSignal;
@@ -110,6 +113,56 @@ export function summaryLengthBudgetClause(budget: number | undefined, minChars: 
     return `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${budget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`;
 }
 
+/** [#6885] A fixed wall-clock budget cannot fit an arbitrarily large input:
+ *  the provider needs roughly a millisecond per input token just to read the
+ *  payload, so the default 25s/50s pair made long-payload chains fail 100%
+ *  (t0 ate its 25s, t1 died on the 50s batch deadline, t2 never dispatched).
+ *  Scale the DEFAULT budget with payload size — 1ms per input token, the same
+ *  cheap estimator the adapter's context guard uses — so a ~55k-token range
+ *  gets a ~55s attempt inside a ~110s batch (the defaults' 2:1 ratio), and
+ *  growth stays bounded by the 600s ceiling the settings parser enforces.
+ *  Explicitly configured fields are bounds the operator chose and never move:
+ *  a field scales only while it still equals its default, and a scaled target
+ *  never outgrows the batch total. Small payloads see the identical budget
+ *  object back (no behavior change below the default target). */
+const SUMMARY_MS_PER_INPUT_TOKEN = 1;
+const SUMMARY_SCALED_BUDGET_CEILING_MS = 600_000;
+export function scaledSummaryBudget<B extends Pick<SummaryBudget, "targetTimeoutMs" | "totalTimeoutMs">>(budget: B, work: readonly SummaryWork[]): B {
+    let tokens = 0;
+    for (const item of work) tokens = Math.max(tokens, defaultCountTokens(item.content) + defaultCountTokens(item.reference ?? ""));
+    const estimatedMs = tokens * SUMMARY_MS_PER_INPUT_TOKEN;
+    let targetTimeoutMs = budget.targetTimeoutMs;
+    let totalTimeoutMs = budget.totalTimeoutMs;
+    if (targetTimeoutMs === SUMMARY_DEFAULT_BUDGET.targetTimeoutMs && estimatedMs > targetTimeoutMs) {
+        targetTimeoutMs = Math.min(SUMMARY_SCALED_BUDGET_CEILING_MS, estimatedMs);
+    }
+    if (totalTimeoutMs === SUMMARY_DEFAULT_BUDGET.totalTimeoutMs && targetTimeoutMs * 2 > totalTimeoutMs) {
+        totalTimeoutMs = Math.min(SUMMARY_SCALED_BUDGET_CEILING_MS, targetTimeoutMs * 2);
+    }
+    if (targetTimeoutMs !== budget.targetTimeoutMs && targetTimeoutMs > totalTimeoutMs) targetTimeoutMs = totalTimeoutMs;
+    if (targetTimeoutMs === budget.targetTimeoutMs && totalTimeoutMs === budget.totalTimeoutMs) return budget;
+    return { ...budget, targetTimeoutMs, totalTimeoutMs };
+}
+
+/** [#6885] Name a rejected attempt without echoing the rejection: provider
+ *  errors may carry credentials, URLs or payload text, and results must never
+ *  leak them (the executor test pins that). Only the adapter's own fixed
+ *  failure literals get a named detail — everything else points at the
+ *  candidate log line, where the adapter already warns with the full reason. */
+function errorDetail(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("External summary input exceeds the target context budget")) return "input exceeds the target context budget";
+    if (message.includes("External summary response is empty")) return "response is empty";
+    if (message.includes("External summary response exceeds its byte budget")) return "response exceeds its byte budget";
+    if (message.includes("External summary response did not complete")) return "response did not complete";
+    if (message.includes("External summary response contains an invalid frame")) return "response contains an invalid frame";
+    if (message.includes("External summary response contains no summary")) return "response contains no summary";
+    if (message.includes("External summary candidate unavailable")) return "candidate unavailable";
+    const http = /External summary upstream rejected the request with HTTP (\d+)/.exec(message);
+    if (http) return `upstream rejected with HTTP ${http[1]}`;
+    return "candidate failed (see candidate log)";
+}
+
 /** Describe why an external-summary batch yielded no usable summary (#2484):
  *  the batch stop reason plus each candidate attempt's outcome, so an operator
  *  can tell timeout / error / cancelled / invalid-plan apart instead of seeing
@@ -126,6 +179,27 @@ export function describeExternalSummaryFailure(batch: ExternalSummaryBatchResult
     if (result.status === "failed") parts.push(`reason=${result.reason}`);
     parts.push(`attempts=[${result.attempts.map((a) => `t${a.targetIndex}:${a.outcome}${a.detail ? ` (${a.detail})` : ""}`).join(",")}]`);
     return parts.join(" ");
+}
+
+/** [#6885] The advice a failed compress carries must name the knob for the
+ *  failure that actually happened: timeouts mean the budget is too small,
+ *  invalid_summary means the output cap is too small, and a chain of plain
+ *  errors means the targets themselves failed — pointing those at
+ *  maxSummaryLength sends the operator to a knob that changes nothing. */
+export function externalSummaryFailureAdvice(batch: ExternalSummaryBatchResult): string {
+    const result = batch.results.find((entry) => entry.status !== "success") ?? batch.results[0];
+    const attempts = result?.attempts ?? [];
+    if (batch.status === "deadline" || attempts.some((a) => a.outcome === "timeout")) {
+        return "candidates timed out against the configured budget — raise the external-summary budget (totalTimeoutMs/targetTimeoutMs) or request less via per-range summaryMaxChars.";
+    }
+    if (attempts.some((a) => a.outcome === "invalid_summary")) {
+        return "summaries longer than the configured cap are rejected whole — raise compress.maxSummaryLength or request less via per-range summaryMaxChars.";
+    }
+    if (attempts.length > 0 && attempts.every((a) => a.outcome === "error")) {
+        return "candidates errored before producing a summary — see the attempt details and the external-summary log lines, and check the target configuration and connectivity.";
+    }
+    if (result?.status === "cancelled" || batch.status === "cancelled") return "the batch was cancelled.";
+    return "do not retry unchanged configuration.";
 }
 
 function validBudget(budget: SummaryBudget): boolean {
@@ -179,7 +253,7 @@ export class ExternalSummaryExecutor {
     private async executeBatchInner(work: readonly SummaryWork[], candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
         const results: ExternalSummaryResult[] = [];
         if (signal?.aborted) return { status: "cancelled", results };
-        const limits = { ...budget };
+        const limits = scaledSummaryBudget({ ...budget }, work);
         if (!validBudget(limits) || work.length === 0 || candidates.length === 0
             || candidates.some((target) => typeof target.summarize !== "function")) {
             return { status: "failed", reason: "invalid_plan", results: [] };
@@ -234,7 +308,7 @@ export class ExternalSummaryExecutor {
     private async executeUntil(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal, sharedDeadline?: number): Promise<ExternalSummaryResult> {
         const attempts: SummaryAttempt[] = [];
         if (signal?.aborted) return { status: "cancelled", attempts };
-        const limits = { ...budget };
+        const limits = scaledSummaryBudget({ ...budget }, [work]);
         if (!validBudget(limits) || !work.content.trim() || !work.instructions.trim()
             || candidates.length === 0 || candidates.some((target) => typeof target.summarize !== "function")) {
             return { status: "failed", reason: "invalid_plan", attempts };
@@ -275,7 +349,7 @@ export class ExternalSummaryExecutor {
                     if (performance.now() >= targetDeadline) expireTarget();
                     if (attempt.signal.aborted) throw new Error("Summary attempt cancelled before dispatch");
                     return target.summarize(request, attempt.signal);
-                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), () => ({ kind: "error" })).finally(release);
+                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), (error) => ({ kind: "error", detail: errorDetail(error) })).finally(release);
                 let result: AttemptResult;
                 try {
                     result = await awaitAttempt(operation, attempt.signal);
@@ -293,7 +367,7 @@ export class ExternalSummaryExecutor {
                 if (result.kind === "aborted" || attempt.signal.aborted) {
                     attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", limits, performance.now() - startedAt) });
                 } else if (result.kind === "error") {
-                    attempts.push({ targetIndex, outcome: "error" });
+                    attempts.push({ targetIndex, outcome: "error", detail: result.detail });
                 } else if (typeof result.value !== "string" || !result.value.trim()
                     || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
                     || result.value.trim().length < (request.minSummaryChars ?? 1)

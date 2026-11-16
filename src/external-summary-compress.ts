@@ -6,7 +6,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
+import { describeExternalSummaryFailure, externalSummaryFailureAdvice, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
 
 // Re-exported for callers that historically imported it here; the canonical
@@ -125,7 +125,11 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); ${describeExternalSummaryFailure(batch)}`);
     // #4833: the bounded attempt diagnostics (source + budgets + outcomes) ride
     // the tool result too — enums and numbers only, never payload bytes.
-    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
+    // [#6885] The advice names the knob for the failure that actually happened:
+    // timeouts point at the budget, over-cap summaries at maxSummaryLength, and
+    // plain errors at the target configuration — never maxSummaryLength for all
+    // three, which sent operators to a knob that changes nothing.
+    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed. Nothing compressed; ${externalSummaryFailureAdvice(batch)}] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.
     // In-place refolds retain their old call id in the kernel; keep their anchor too.

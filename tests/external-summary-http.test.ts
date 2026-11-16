@@ -267,7 +267,7 @@ test("external summary HTTP: an exhausted transient chain logs every attempt and
     await upstream((_req, res) => { res.writeHead(503); res.end("upstream unavailable"); }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
         assert.equal(result.status, "failed");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "upstream rejected with HTTP 503" }]);
     });
     assert.equal(lines.filter((line) => line.includes("rejected: HTTP 503")).length, 3);
 });
@@ -282,7 +282,7 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
         await upstream((_req, res) => res.end(JSON.stringify(body)), async (url) => {
             const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url, protocol), 4096)], budget);
             assert.equal(result.status, "failed");
-            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+            assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "response did not complete" }]);
         });
     });
 }
@@ -295,6 +295,35 @@ for (const body of ["", "<html>Gateway error</html>", "data: {\"type\":\"respons
         });
     });
 }
+
+test("external summary HTTP: a context-budget rejection warns before dispatch instead of vanishing", async () => {
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    // No server: the guard throws before any fetch is dispatched.
+    const candidate = createSummaryHttpCandidate(
+        { ...target("http://127.0.0.1:9/v1/chat/completions"), contextWindow: 300, outputTokens: 100 },
+        4096,
+    );
+    const result = await new ExternalSummaryExecutor(1).execute(work, [candidate], budget);
+    assert.equal(result.status, "failed");
+    if (result.status !== "failed") throw new Error("unreachable");
+    assert.equal(result.attempts[0]?.detail, "input exceeds the target context budget");
+    assert.ok(lines.some((line) => line.includes("rejected before dispatch") && line.includes("context-budget")),
+        `expected a pre-dispatch context-budget warn, got: ${lines.join(" | ")}`);
+});
+
+test("external summary HTTP: a parse failure warns with its reason instead of vanishing", async () => {
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    await upstream((_req, res) => res.end(streamCompletion("responses").trimEnd()), async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "failed");
+        if (result.status !== "failed") throw new Error("unreachable");
+        assert.equal(result.attempts[0]?.detail, "response did not complete");
+    });
+    assert.ok(lines.some((line) => line.includes("rejected") && line.includes("did not complete")),
+        `expected a parse-failure warn, got: ${lines.join(" | ")}`);
+});
 
 test("external summary HTTP: response byte cap and invalid UTF-8 fail closed", async () => {
     for (const response of [Buffer.from(JSON.stringify(completion("responses", "x".repeat(4096)))), Buffer.from([0xff])]) {

@@ -1,5 +1,5 @@
 import type { SummaryBudget, SummaryCandidate, SummaryWork } from "./external-summary.js";
-import { summaryAbortSource } from "./external-summary.js";
+import { scaledSummaryBudget, summaryAbortSource } from "./external-summary.js";
 import { defaultCountTokens } from "acp-kernel";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, type UpstreamFailureKind } from "./upstream-fail.js";
 import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.js";
@@ -231,7 +231,14 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             const inputTokens = defaultCountTokens(system) + defaultCountTokens(content);
             const payload = summaryPayload(plan.protocol, plan.model, system, content, plan.stream ?? false, true, url.hostname, plan.contextWindow);
             if (plan.outputTokens !== undefined) {
-                if (plan.contextWindow !== undefined && defaultCountTokens(system) + defaultCountTokens(content) + 256 + plan.outputTokens > plan.contextWindow) throw new Error("External summary input exceeds the target context budget");
+                if (plan.contextWindow !== undefined && defaultCountTokens(system) + defaultCountTokens(content) + 256 + plan.outputTokens > plan.contextWindow) {
+                    // [#6885] This throw happens before any fetch, so without a
+                    // warn line the executor records a bare `t0:error` and the
+                    // operator has nothing to grep for — log it like a fetch
+                    // failure, with the numbers that explain it.
+                    loggerLog("warn", `[external-summary] candidate ${plan.model} rejected before dispatch (context-budget; input≈${inputTokens}tok, contextWindow=${plan.contextWindow}, outputTokens=${plan.outputTokens}): External summary input exceeds the target context budget`);
+                    throw new Error("External summary input exceeds the target context budget");
+                }
                 if (plan.protocol === "google") {
                     const generationConfig = payload.generationConfig as Record<string, unknown>;
                     generationConfig.maxOutputTokens = plan.outputTokens;
@@ -253,8 +260,12 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             // #4833: safe per-attempt diagnostics appended to every failure line —
             // elapsed time, configured budgets, wire shape and size estimates, so a
             // deadline abort is distinguishable from a provider rejection at a glance.
+            // [#6885] Quote the EFFECTIVE budget, not the configured one: the
+            // executor scales the default budget with payload size, so an attempt
+            // may legitimately run past the configured target/total.
+            const effectiveBudget = budget === undefined ? undefined : scaledSummaryBudget(budget, [work]);
             const staticDiagBits = [
-                `budget target=${budget?.targetTimeoutMs ?? "?"}ms total=${budget?.totalTimeoutMs ?? "?"}ms`,
+                `budget target=${effectiveBudget?.targetTimeoutMs ?? "?"}ms total=${effectiveBudget?.totalTimeoutMs ?? "?"}ms`,
                 `protocol=${plan.protocol}`,
                 `stream=${plan.stream ?? false}`,
                 `payload≈${Buffer.byteLength(body, "utf8")}B`,
@@ -303,7 +314,16 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                         }
                         throw new Error(`External summary upstream rejected the request with HTTP ${dispatched.response.status}`);
                     }
-                    const result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
+                    let result: string;
+                    try {
+                        result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
+                    } catch (error) {
+                        // [#6885] A fetch that succeeded and then failed to parse
+                        // used to vanish the same way as the guard throw above:
+                        // the executor kept a bare `t0:error` with no log line.
+                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} rejected: ${maskUrlsInText(error instanceof Error ? error.message : String(error))} (${diagnostics()})`);
+                        throw error;
+                    }
                     signal.throwIfAborted();
                     return result;
                 } finally {

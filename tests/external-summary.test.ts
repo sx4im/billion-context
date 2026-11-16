@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExternalSummaryExecutor, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
+import { ExternalSummaryExecutor, describeExternalSummaryFailure, externalSummaryFailureAdvice, scaledSummaryBudget, type ExternalSummaryBatchResult, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
 
 const work: SummaryWork = { content: "Historical task evidence", instructions: "Preserve constraints and unfinished work", reference: "Read-only current task" };
 const budget: SummaryBudget = { totalTimeoutMs: 2000, targetTimeoutMs: 500, maxSummaryBytes: 200 };
@@ -44,8 +44,81 @@ test("external summary: failed targets run once in order, without leaking provid
 
 test("external summary: exhaustion never invents a summary or main-model fallback", async () => {
     const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("failed"); } }], budget);
-    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error" }] });
+    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "candidate failed (see candidate log)" }] });
     assert.equal("summary" in result, false);
+});
+
+// #6885: the default budget scales with payload size — a fixed 25s/50s pair
+// cannot fit an arbitrarily large input, so a long-payload chain failed 100%
+// even though the provider would have answered given a sane window.
+const defaultBudget: SummaryBudget = { totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 65_536 };
+
+test("#6885: default budget scales with payload size, explicit budgets never move", () => {
+    const small: SummaryWork = { content: "x".repeat(100), instructions: "summarize", reference: "" };
+    assert.equal(scaledSummaryBudget(defaultBudget, [small]), defaultBudget);
+    // The reporter's ~270KB payload is ~55k input tokens: 220_000 chars at the
+    // shared chars/4 estimate. The first attempt must be allowed ~55s, and the
+    // batch ~110s (the defaults' 2:1 ratio), or the chain cannot succeed.
+    const large: SummaryWork = { content: "x".repeat(220_000), instructions: "summarize", reference: "" };
+    assert.deepEqual(scaledSummaryBudget(defaultBudget, [large]), { totalTimeoutMs: 110_000, targetTimeoutMs: 55_000, maxSummaryBytes: 65_536 });
+    // An explicitly configured budget is a bound the operator chose: even a
+    // huge payload must not stretch it.
+    const explicit: SummaryBudget = { totalTimeoutMs: 2000, targetTimeoutMs: 500, maxSummaryBytes: 200 };
+    assert.equal(scaledSummaryBudget(explicit, [large]), explicit);
+    // A default target never outgrows an explicitly capped total.
+    assert.deepEqual(scaledSummaryBudget({ ...defaultBudget, totalTimeoutMs: 30_000 }, [large]), { totalTimeoutMs: 30_000, targetTimeoutMs: 30_000, maxSummaryBytes: 65_536 });
+    // A default total is not stretched by an explicitly capped target.
+    const explicitTarget: SummaryBudget = { ...defaultBudget, targetTimeoutMs: 10_000 };
+    assert.equal(scaledSummaryBudget(explicitTarget, [large]), explicitTarget);
+    // Growth is bounded by the same 600s ceiling the settings parser enforces.
+    const huge: SummaryWork = { content: "x".repeat(4_000_000), instructions: "summarize", reference: "" };
+    assert.deepEqual(scaledSummaryBudget(defaultBudget, [huge]), { totalTimeoutMs: 600_000, targetTimeoutMs: 600_000, maxSummaryBytes: 65_536 });
+});
+
+test("#6885: an explicit budget is never stretched by payload size", async () => {
+    const big: SummaryWork = { content: "x".repeat(200_000), instructions: "summarize", reference: "" };
+    const result = await new ExternalSummaryExecutor(1).execute(big, [{ summarize: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return "too late";
+    } }, successful("backup")], { totalTimeoutMs: 200, targetTimeoutMs: 100, maxSummaryBytes: 200 });
+    assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "success"]);
+});
+
+test("#6885: a non-fetch failure keeps its reason in the attempt instead of a bare error", async () => {
+    const result = await new ExternalSummaryExecutor(1).execute(work, [
+        { summarize: async () => { throw new Error("External summary input exceeds the target context budget"); } },
+        { summarize: async () => { throw new Error("External summary response contains no summary"); } },
+        successful("backup"),
+    ], budget);
+    assert.equal(result.status, "success");
+    assert.deepEqual(result.attempts.map((item) => [item.outcome, item.detail]), [
+        ["error", "input exceeds the target context budget"],
+        ["error", "response contains no summary"],
+        ["success", undefined],
+    ]);
+    // The failure line now names the reason instead of "t0:error,t1:error".
+    assert.equal(describeExternalSummaryFailure({ status: "finished", results: [result] }), "batch=finished result=success attempts=[t0:error (input exceeds the target context budget),t1:error (response contains no summary),t2:success]");
+});
+
+test("#6885: an unknown provider error stays out of the result — only a pointer to the log", async () => {
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("private-key private-url source-content"); } }], budget);
+    assert.equal(result.status, "failed");
+    if (result.status !== "failed") throw new Error("unreachable");
+    assert.equal(result.attempts[0]?.detail, "candidate failed (see candidate log)");
+    assert.equal(JSON.stringify(result).includes("private"), false);
+});
+
+test("#6885: the compress refusal names the actual knob for the actual failure", () => {
+    const timedOut: ExternalSummaryBatchResult = { status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "timeout", detail: "target-timeout 25000ms (elapsed 25015ms)" }] }] };
+    assert.match(externalSummaryFailureAdvice(timedOut), /totalTimeoutMs/);
+    assert.equal(externalSummaryFailureAdvice(timedOut).includes("maxSummaryLength"), false);
+    const deadline: ExternalSummaryBatchResult = { status: "deadline", results: [] };
+    assert.match(externalSummaryFailureAdvice(deadline), /totalTimeoutMs/);
+    const overCap: ExternalSummaryBatchResult = { status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "invalid_summary", detail: "summary 20001 chars exceeds cap 20000" }] }] };
+    assert.match(externalSummaryFailureAdvice(overCap), /maxSummaryLength/);
+    const errored: ExternalSummaryBatchResult = { status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "input exceeds the target context budget" }] }] };
+    assert.match(externalSummaryFailureAdvice(errored), /target configuration/);
+    assert.equal(externalSummaryFailureAdvice(errored).includes("maxSummaryLength"), false);
 });
 
 test("external summary: empty and oversized UTF-8 output fail over", async () => {

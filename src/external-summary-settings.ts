@@ -54,7 +54,7 @@ export interface ExternalSummaryChain {
     autoFoldTargetTokens?: number;
 }
 
-const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
+export const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
     totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 64 * 1024,
 };
 
