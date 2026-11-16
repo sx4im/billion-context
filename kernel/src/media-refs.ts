@@ -24,6 +24,19 @@
  * surviving text alone?", and an unenumerated shape answers that with no
  * evidence either way.
  *
+ * #6875: DSH (DeepSeek Harness) read_image / screenshot results carry
+ * their image as an opaque OpenAI part `{type:"image",
+ * attachment:{attachmentId, mediaType, bytes, ...}}` — `bytes` is a byte
+ * COUNT, not a payload. The blob lives in DSH's local content-addressed
+ * store (`~/.dsh/attachments/v1/objects/<hash[0:2]>/<hash>`) and is
+ * re-acquirable from the attachmentId alone (reporter audit: 504 blobs,
+ * missing=0), so the attachmentId is a durable re-access handle in exactly
+ * the #5620 sense — a bare id, like a DeepSeek `file_id`, never an
+ * expiring URL. Before this enumeration the shape fell through to the
+ * conservative pin and every DSH image message became a permanent
+ * non-foldable anchor (~160K tokens stuck). An attachment with no usable
+ * id still pins (conservative, same as any other unenumerated shape).
+ *
  * #5865-P2 (PR #5865 review F2): the litmus also requires the handle to be
  * DURABLE. A pre-signed/expiring HTTP(S) URL (S3/GCS/Azure-SAS/CDN tokens)
  * satisfies "has a ref" but lapses — by the time a folded summary is
@@ -88,6 +101,19 @@ export function looksEphemeralSignedUrl(ref: string): boolean {
   return false;
 }
 
+/** #6875: a DSH image part's re-access handle is its attachment's
+ *  content-addressed id — push it verbatim (bare-id parallel to a DeepSeek
+ *  file_id; pushRef's inline-data/ephemeral guards do not apply to it).
+ *  An attachment with no usable id pushes nothing, so the message keeps
+ *  pinning (conservative). */
+function pushDshAttachmentRef(
+  refs: string[],
+  part: Record<string, unknown>,
+): void {
+  if (part.type !== "image") return;
+  pushRef(refs, asObj(part.attachment)?.attachmentId);
+}
+
 function pushRef(refs: string[], ref: unknown): void {
   if (typeof ref !== "string" || ref.length === 0 || isInlineDataUrl(ref)) return;
   // #5865-P2: an expiring handle is not a re-access handle — keep the
@@ -111,7 +137,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
     else if (roc.type === "file") {
       pushRef(refs, roc.file_id);
       pushRef(refs, roc.url);
-    }
+    } else if (roc.type === "image") pushDshAttachmentRef(refs, roc);
   }
   if (Array.isArray(m.rawOpenaiContentParts)) {
     for (const p of m.rawOpenaiContentParts) {
@@ -121,7 +147,7 @@ export function extractMediaRefs(message: CoreMessage): string[] {
       else if (part.type === "file") {
         pushRef(refs, part.file_id);
         pushRef(refs, part.url);
-      }
+      } else if (part.type === "image") pushDshAttachmentRef(refs, part);
     }
   }
 
