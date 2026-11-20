@@ -1705,6 +1705,253 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
     };
 }
 
+// ─── #7416: hallucinated turn bleed ────────────────────────────────────────
+// When the model proxies long sessions whose history carries render tags, it
+// can miss its native turn stop and emit a fake next user turn in plain text:
+// a bare "user" line, a second synthetic render tag, a hallucinated client
+// user-turn envelope (a USER_REQUEST / SYSTEM_MESSAGE / ADDITIONAL_METADATA
+// block, or the "The following is a SYSTEM_MESSAGE not actually sent by the
+// user." sentence), and then a hallucinated next assistant turn — with REAL
+// functionCall parts in the same response. The tag-echo stripper removes the
+// echoed tags but lets the fake prose and the post-bleed calls through, and
+// the loop executes them as unauthorized tool calls.
+//
+// This filter is the turn-boundary cut: outside fenced code blocks, a bare
+// "user" line followed by one of those envelopes ends the assistant turn —
+// the text truncates right before the user line and everything after it is
+// dropped. It is a PROSE-only decision (visible part.text); thought parts
+// never reach it (KDD #10), and genuine functionCall arguments are never
+// inspected or altered here (#1039) — the adapter drops post-bleed call
+// parts by stream position, not by content.
+//
+// Fence tracking is CommonMark: a line opening with three or more backticks
+// or tildes (up to three leading spaces) opens a fenced block, closed by a
+// line of the same fence char at least as long with nothing but whitespace
+// after it. Literal "user" lines and envelopes inside a fence are examples,
+// never a bleed. A bare user line is held — with the newline of the line
+// before it, so the cut lands exactly before the user line — until the next
+// non-blank line decides it: an envelope trips the cut, ordinary prose
+// releases the held lines, and a line still growing into an envelope prefix
+// keeps waiting. At stream end an undecided hold is released as prose
+// (content preservation); past the hold cap it is released too.
+const BLEED_OPENERS = [
+    "\x3cacp",
+    "\x3cUSER_REQUEST",
+    "\x3cADDITIONAL_METADATA",
+    "\x3cSYSTEM_MESSAGE",
+    "The following is a \x3cSYSTEM_MESSAGE",
+];
+const BLEED_OPENERS_LOWER = BLEED_OPENERS.map((o) => o.toLowerCase());
+// Bound for a held suspect run (user line + blank lines): a real bleed
+// envelope arrives immediately after the user line, so a longer hold is
+// prose, not a bleed in progress.
+const BLEED_HOLD_CAP = 4096;
+const USER_LINE = /^[ \t]*user[ \t]*\r?$/i;
+const BLANK_LINE = /^[ \t]*\r?$/;
+const FENCE_RUN = /^[ \t]{0,3}(`{3,}|~{3,})/;
+
+export interface TurnBleedFilter {
+    push(delta: string): string;
+    flush(): string;
+    /** True once a hallucinated turn was cut — terminal, push/flush return "". */
+    tripped(): boolean;
+    pending(): boolean;
+}
+
+export function createTurnBleedFilter(onTrip?: (snippet: string) => void): TurnBleedFilter {
+    let inFence = false;
+    let fenceChar = "";
+    let fenceLen = 0;
+    // Content of the current incomplete line (no newline yet), for fence /
+    // user-line detection. lineEmitted counts how many of its chars already
+    // streamed out: ordinary partial lines flow immediately — only a line
+    // that could still grow into a bare user line is held back, so text
+    // deltas keep their per-chunk order (a held "Hello " would otherwise
+    // reorder a text event behind a later reasoning event).
+    let lineText = "";
+    let lineEmitted = 0;
+    // A completed bare user line plus the blank lines after it, held while
+    // the next non-blank line decides whether this is a hallucinated turn.
+    let suspect: string | null = null;
+    // The newline of the last completed line, held one line back so the cut
+    // lands exactly before the user line instead of after its newline.
+    let nlPending = false;
+    let isTripped = false;
+
+    const trip = (snippet: string): void => {
+        isTripped = true;
+        suspect = null;
+        lineText = "";
+        lineEmitted = 0;
+        nlPending = false;
+        onTrip?.(snippet);
+    };
+
+    const fenceRun = (content: string): { ch: string; len: number; rest: string } | null => {
+        const m = FENCE_RUN.exec(content);
+        if (m === null) return null;
+        const run = m[1]!;
+        const ch = run[0]!;
+        const rest = content.slice(m[0].length);
+        if (ch === "`" && rest.includes("`")) return null;
+        return { ch, len: run.length, rest };
+    };
+
+    // Could this partial line still complete into a bare user line? Only a
+    // "user" prefix (with optional leading/trailing spaces) is held; any
+    // divergence streams at once. Once diverged a line can never become a
+    // bare user line, so a completed user line always has lineEmitted 0.
+    const couldBeUserLine = (content: string): boolean => {
+        const t = content.replace(/^[ \t]+/, "");
+        return "user".startsWith(t.toLowerCase()) || /^user[ \t]*$/i.test(t);
+    };
+
+    // What a (possibly partial) next-line head means: "trip" when it opens
+    // an envelope, "wait" while it may still grow into one, "release" when
+    // it can no longer be one. An empty head is always "wait" — leading
+    // whitespace before an envelope is still undecided.
+    const decide = (headLower: string): "trip" | "release" | "wait" => {
+        if (headLower.length === 0) return "wait";
+        for (const opener of BLEED_OPENERS_LOWER) {
+            if (headLower.startsWith(opener)) return "trip";
+            if (opener.startsWith(headLower)) return "wait";
+        }
+        return "release";
+    };
+
+    const process = (delta: string): string => {
+        if (isTripped) return "";
+        let out = "";
+        // Emit the newline held from the previous completed line: a new line
+        // has started, and it is not (yet) a user line.
+        const emitPendingNewline = (): void => {
+            if (nlPending) {
+                out += "\n";
+                nlPending = false;
+            }
+        };
+        // Release a held suspect run as ordinary prose: its newline, the
+        // user line, and its blank lines.
+        const releaseSuspect = (): void => {
+            if (suspect === null) return;
+            emitPendingNewline();
+            out += suspect;
+            suspect = null;
+        };
+        const handleNormalLine = (content: string): void => {
+            const run = fenceRun(content);
+            if (inFence) {
+                emitPendingNewline();
+                out += content.slice(lineEmitted);
+                nlPending = true;
+                if (run !== null && run.ch === fenceChar && run.len >= fenceLen && run.rest.trim() === "") {
+                    inFence = false;
+                }
+                return;
+            }
+            if (run !== null) {
+                inFence = true;
+                fenceChar = run.ch;
+                fenceLen = run.len;
+                emitPendingNewline();
+                out += content.slice(lineEmitted);
+                nlPending = true;
+                return;
+            }
+            if (USER_LINE.test(content)) {
+                // Hold the line: its verdict needs the next non-blank line.
+                // The pending newline stays held with it so a trip cuts
+                // exactly before the user line.
+                suspect = content + "\n";
+                return;
+            }
+            emitPendingNewline();
+            out += content.slice(lineEmitted);
+            nlPending = true;
+        };
+        // Handle one completed line's content (no trailing newline).
+        const handleLine = (content: string): void => {
+            if (isTripped) return;
+            if (suspect !== null) {
+                if (BLANK_LINE.test(content)) {
+                    suspect += content + "\n";
+                    return;
+                }
+                const verdict = decide(content.replace(/^[ \t]+/, "").toLowerCase());
+                if (verdict === "trip") {
+                    trip(content.slice(0, 80));
+                    return;
+                }
+                // Ordinary prose after a bare user line: the user line was
+                // content after all — release it, then handle this line.
+                releaseSuspect();
+            }
+            handleNormalLine(content);
+        };
+        let rest = delta;
+        for (;;) {
+            const nl = rest.indexOf("\n");
+            if (nl < 0) {
+                lineText += rest;
+                break;
+            }
+            lineText += rest.slice(0, nl);
+            const content = lineText;
+            lineText = "";
+            handleLine(content);
+            lineEmitted = 0;
+            if (isTripped) return out.replace(/\r$/, "");
+            rest = rest.slice(nl + 1);
+        }
+        // A partial next line while a suspect is held may already decide it.
+        if (!isTripped && suspect !== null) {
+            if (suspect.length > BLEED_HOLD_CAP) {
+                releaseSuspect();
+            } else if (lineText.length > 0) {
+                const verdict = decide(lineText.replace(/^[ \t]+/, "").toLowerCase());
+                if (verdict === "trip") {
+                    trip(lineText.slice(0, 80));
+                    return out.replace(/\r$/, "");
+                }
+                if (verdict === "release") {
+                    releaseSuspect();
+                }
+            }
+        }
+        // A partial line with no suspect streams at once unless it could
+        // still grow into a bare user line.
+        if (!isTripped && suspect === null && !couldBeUserLine(lineText)) {
+            emitPendingNewline();
+            out += lineText.slice(lineEmitted);
+            lineEmitted = lineText.length;
+        }
+        return out;
+    };
+
+    return {
+        push: process,
+        flush(): string {
+            if (isTripped) return "";
+            let out = "";
+            if (nlPending) {
+                out += "\n";
+                nlPending = false;
+            }
+            if (suspect !== null) {
+                // Undecided at stream end: content preservation wins.
+                out += suspect;
+                suspect = null;
+            }
+            out += lineText.slice(lineEmitted);
+            lineText = "";
+            lineEmitted = 0;
+            return out;
+        },
+        tripped: () => isTripped,
+        pending: () => suspect !== null || lineText.length > 0 || nlPending,
+    };
+}
+
 function stripParts(content: unknown, drop: boolean, requestText?: string): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((part) => {

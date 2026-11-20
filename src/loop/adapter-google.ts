@@ -2,7 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, createTurnBleedFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { createSseFramer, sseEventData } from "../sse-util.js";
@@ -340,8 +340,22 @@ export function createGoogleAdapter(
                 }),
             );
             const tagFilter = makeFilter();
+            // #7416: hallucinated turn bleed — a bare "user" line followed by
+            // a client user-turn envelope ends the assistant turn. The bleed
+            // filter runs on RAW visible text, ahead of the tag-echo filter:
+            // the tag stripper would eat the synthetic acp tag that confirms
+            // the bleed, and the cut has to land before any post-bleed
+            // functionCall part reaches pending/settleToolCalls().
+            const bleedFilter = createTurnBleedFilter((snippet) => {
+                loggerLog("warn", `[tag-echo] turn-bleed cut: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            });
+            let bleedTripped = false;
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
-                const tail = tagFilter.flush();
+                // A held bleed suspect is undecided prose at stream end; a
+                // tripped filter discards it. Either way it flows through the
+                // tag filter like any other tail.
+                const bledTail = bleedFilter.flush();
+                const tail = bledTail.length > 0 ? tagFilter.push(bledTail) + tagFilter.flush() : tagFilter.flush();
                 if (tail.length > 0) {
                     yield { kind: "text", delta: tail, raw: buildChunk([{ text: tail }]) } as ParsedStreamEvent;
                 }
@@ -593,6 +607,10 @@ export function createGoogleAdapter(
                 // ahead of settle (no double-send, no original-bytes leak).
                 let editedParts: GooglePart[] | null = null;
                 for (let i = 0; i < parts.length; i++) {
+                    // #7416: once the bleed cut, the rest of this chunk is a
+                    // turn that never happened — no further part (least of
+                    // all a functionCall) enters pending or the wire.
+                    if (bleedTripped) continue;
                     const part = parts[i];
                     if (!part || typeof part !== "object") continue;
                     const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
@@ -627,13 +645,29 @@ export function createGoogleAdapter(
                     // A signature may belong to ordinary text, without thought:true.
                     // Preserve its bytes and part boundary on both replay paths.
                     const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
-                    const clean = signed ? part.text : tagFilter.push(part.text);
+                    // #7416: the bleed cut runs on raw visible text, before
+                    // the tag-echo filter (which would strip the confirming
+                    // synthetic tag). Thought parts never reach it (#1960).
+                    const bled = bleedFilter.push(part.text);
+                    if (bleedFilter.tripped()) bleedTripped = true;
+                    const clean = signed ? bled : tagFilter.push(bled);
                     if (clean !== part.text) {
                         editedParts ??= [...parts];
-                        editedParts[i] = { ...part, text: clean };
+                        if (signed) {
+                            // #7416: a truncated signed part no longer matches
+                            // its signature — drop the signature instead of
+                            // forwarding mismatched bytes, and carry no
+                            // rawGooglePart below, so the loop accumulates
+                            // the truncated text for the re-request rebuild.
+                            const rest = { ...part };
+                            delete rest.thoughtSignature;
+                            editedParts[i] = { ...rest, text: clean };
+                        } else {
+                            editedParts[i] = { ...part, text: clean };
+                        }
                     }
                     if (clean.length === 0) continue;
-                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed ? { rawGooglePart: part } : {}) });
+                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed && bled === part.text ? { rawGooglePart: part } : {}) });
                 }
                 // Decide wire output only after every prose sibling has been
                 // cleaned. Each complete frame belongs to one event, regardless
@@ -651,13 +685,26 @@ export function createGoogleAdapter(
                     const carrier = partEvents.find(event => event.kind === "text") ?? partEvents[0];
                     if (carrier) carrier.raw = raw;
                     else yield { kind: "meta", chunk: raw } as ParsedStreamEvent;
+                } else if (bleedTripped && nonCallPartsOf(storedParsed).length > 0) {
+                    // #7416: this chunk mixed truncated text with post-bleed
+                    // functionCall parts. The raw frame must NOT replay — it
+                    // still carries the fake calls — so the wire frame is
+                    // rebuilt from the cleaned non-call parts only. The text
+                    // event is rawHandled with no raw otherwise, and round 1
+                    // would never forward its delta to the client.
+                    const raw = sseFrame(cloneChunk(storedParsed, { parts: nonCallPartsOf(storedParsed), dropFinishReason: true }));
+                    const carrier = partEvents.find(event => event.kind === "text") ?? partEvents[0];
+                    if (carrier) carrier.raw = raw;
+                    else yield { kind: "meta", chunk: raw } as ParsedStreamEvent;
                 }
                 yield* partEvents;
                 // #3158: standalone thoughtSignature parts modeled no event above
                 // and vanished from the client's stream. The complete frame
                 // above now owns their wire bytes; record the signatures once
                 // for the proxy-tool rebuild as well.
-                if (callIndexes.length === 0) {
+                // #7416: a tripped chunk's standalone signatures belong to
+                // the hallucinated turn — never record them.
+                if (callIndexes.length === 0 && !bleedTripped) {
                     const sigParts = standaloneSigParts(parsed);
                     if (sigParts.length > 0) {
                         for (const sp of sigParts) {
@@ -668,6 +715,12 @@ export function createGoogleAdapter(
                 if (callIndexes.length === 0 && !finishReason && parts.length === 0) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
+
+                // #7416: the bleed cut ends the round here — cancel the
+                // upstream stream early (break out of iterGoogleChunks) and
+                // settle below with a synthesized STOP instead of the
+                // upstream finish reason, which belongs to the fake turn.
+                if (bleedTripped) break;
 
                 if (finishReason && !sawDone) {
                     yield* flushFilter();
@@ -697,6 +750,36 @@ export function createGoogleAdapter(
                         yield { kind: "done", finishReason, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     }
                 }
+            }
+
+            // #7416: the hallucinated turn ended the round. Genuine calls
+            // buffered BEFORE the bleed still settle (they belong to the
+            // real turn); post-bleed calls never entered pending, so they
+            // cannot execute. The round closes with a synthesized STOP —
+            // the upstream finish reason, if any arrives later, belongs to
+            // the turn that never happened.
+            if (bleedTripped) {
+                yield* flushFilter();
+                yield* settleToolCalls();
+                if (lastUsage && !usageEmitted) {
+                    usageEmitted = true;
+                    yield usageEvent();
+                }
+                sawDone = true;
+                maybeWarnDegenerate("STOP");
+                maybeSummarizeStrips();
+                if (sawRealToolCall) {
+                    // Settle already replayed the genuine call chunks; the
+                    // stub carries the finish so the client stream ends
+                    // with a reason, and the done suppresses a second
+                    // synthesized completion (same shape as the normal
+                    // finish path above).
+                    yield { kind: "meta", chunk: buildChunk([], { candidate: { finishReason: "STOP" } }) } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: "STOP", suppressCompletion: true } as ParsedStreamEvent;
+                } else {
+                    yield { kind: "done", finishReason: "STOP" } as ParsedStreamEvent;
+                }
+                return;
             }
 
             // A stream that died mid-flight still has to hand the client the
